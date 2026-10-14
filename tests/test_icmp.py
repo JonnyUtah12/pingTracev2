@@ -107,7 +107,7 @@ def test_v2_database_migrates_and_keeps_rows(tmp_path):
         conn = sqlite3.connect(db)
         assert conn.execute("SELECT count(*) FROM probes").fetchone()[0] == 0
         assert conn.execute("SELECT value FROM meta WHERE key='schema_version'"
-                            ).fetchone()[0] == "3"
+                            ).fetchone()[0] == str(database.SCHEMA_VERSION)
         conn.close()
     finally:
         store.close()

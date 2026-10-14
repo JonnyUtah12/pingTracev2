@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 import config
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS targets (
     label      TEXT,
     interval_s REAL NOT NULL,
     enabled    INTEGER NOT NULL DEFAULT 1,
+    trace_enabled INTEGER NOT NULL DEFAULT 0,
+    trace_interval_s REAL NOT NULL DEFAULT 60,
     created_at TEXT NOT NULL,
     UNIQUE (host, port, proto)
 );
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS traces (
     reached     INTEGER NOT NULL,
     hop_count   INTEGER NOT NULL,
     duration_ms INTEGER,
+    method      TEXT,
     hops_json   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS traces_ix ON traces (target_id, id DESC);
@@ -120,6 +123,19 @@ class Store:
             c.executescript(_SCHEMA)
             if prev is not None and int(prev["value"]) < 3:
                 self._migrate_targets_allow_icmp(c)
+            if prev is not None and int(prev["value"]) < 4:
+                # v4: continuous route tracing per target. Plain ADD COLUMN is
+                # enough - no constraint changes, so no table rebuild.
+                cols = {r["name"] for r in c.execute("PRAGMA table_info(targets)")}
+                if "trace_enabled" not in cols:
+                    c.execute("ALTER TABLE targets ADD COLUMN trace_enabled "
+                              "INTEGER NOT NULL DEFAULT 0")
+                if "trace_interval_s" not in cols:
+                    c.execute("ALTER TABLE targets ADD COLUMN trace_interval_s "
+                              "REAL NOT NULL DEFAULT 60")
+                tcols = {r["name"] for r in c.execute("PRAGMA table_info(traces)")}
+                if "method" not in tcols:
+                    c.execute("ALTER TABLE traces ADD COLUMN method TEXT")
             c.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
             c.execute("INSERT INTO meta(key, value) VALUES('app_version', ?) "
@@ -204,12 +220,13 @@ class Store:
         return self._row(self._conn().execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone())
 
     def update_target(self, target_id: int, **fields) -> dict | None:
-        allowed = {"port", "proto", "label", "interval_s", "enabled", "host"}
+        allowed = {"port", "proto", "label", "interval_s", "enabled", "host",
+                   "trace_enabled", "trace_interval_s"}
         sets, vals = [], []
         for k, v in fields.items():
             if k not in allowed or v is None:
                 continue
-            if k == "enabled":
+            if k in ("enabled", "trace_enabled"):
                 v = 1 if v else 0
             sets.append(f"{k}=?")
             vals.append(v)
@@ -254,10 +271,11 @@ class Store:
         with self._write_lock, self._conn() as c:
             c.execute(
                 "INSERT INTO traces(target_id, host, dest_ip, created_at, reached, "
-                "hop_count, duration_ms, hops_json) VALUES(?,?,?,?,?,?,?,?)",
+                "hop_count, duration_ms, method, hops_json) VALUES(?,?,?,?,?,?,?,?,?)",
                 (target_id, host, result.get("dest_ip"), iso_utc(),
                  1 if result.get("reached") else 0, int(result.get("hop_count") or 0),
-                 int(result.get("duration_ms") or 0), json.dumps(result.get("hops") or [])))
+                 int(result.get("duration_ms") or 0), result.get("method"),
+                 json.dumps(result.get("hops") or [])))
             new_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
             c.execute("DELETE FROM traces WHERE target_id=? AND id NOT IN "
                       "(SELECT id FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?)",
@@ -289,7 +307,7 @@ class Store:
         """Trace summaries (no hop payloads) for the history dropdown."""
         limit = max(1, min(int(limit), MAX_TRACES_KEPT_PER_TARGET))
         rows = self._conn().execute(
-            "SELECT id, target_id, host, dest_ip, created_at, reached, hop_count, duration_ms "
+            "SELECT id, target_id, host, dest_ip, created_at, reached, hop_count, duration_ms, method "
             "FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?", (target_id, limit)).fetchall()
         return [{**dict(r), "reached": bool(r["reached"])} for r in rows]
 

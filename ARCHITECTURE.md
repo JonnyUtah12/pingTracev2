@@ -82,9 +82,23 @@ Honesty rules baked into the result: one probe per TTL, extra probes only for
 hops that answered; silent hops are kept as `*` rows rather than dropped; the
 result carries a `note` that each hop proves the outbound path *to* that
 router and the return path *from* it (return paths can differ - asymmetric
-routing). Traces are on-demand only (a dashboard button + `POST
-/api/targets/{id}/trace`); nothing periodic runs. Results persist in the
-`traces` table, newest 20 per target.
+routing). Results persist in the `traces` table, newest 20 per target.
+
+### Continuous tracing (v1.3)
+
+`targets.trace_enabled` / `targets.trace_interval_s` (schema v4) make a
+target's route trace repeat until switched off. The supervisor task already
+reconciling probe loops (`_supervise`) additionally spawns one
+`_trace_worker` task per enabled target: it calls the same `run_trace`,
+sleeps the configured interval (clamped 5s..1h), and re-reads its target
+row each round so disable/delete take effect within one sleep. Independence
+is per-task: one slow or stuck trace only delays that target's next round
+(the per-target trace lock prevents overlap); other targets keep running.
+The dashboard reads the newest stored trace (`GET /api/targets/{id}/trace`,
+throttled to 5s, re-rendered only when the row id changes) rather than
+triggering traces from the browser, so closing the page does not stop the
+loop. `traces.method` (added in v4) records which engine produced each row
+so a stored history entry stays self-describing.
 
 ## 3. Data model
 
@@ -95,9 +109,11 @@ queries by choosing raw vs rollup on the requested window, so a 30-day query
 never scans raw rows. Packet loss is `failures / probes` per bucket; jitter is
 the mean absolute RTT delta between consecutive successful probes.
 
-`traces` (schema v2) holds on-demand route traces: one row per run with the
-hop list as JSON, newest 20 per target kept, cascaded on target delete. They
-are deliberately not in `probes`/`rollup` - a trace is a multi-probe event
+`traces` (schema v2) holds route traces: one row per run with the
+hop list as JSON, newest 20 per target kept, cascaded on target delete.
+Schema v4 adds `targets.trace_enabled`/`targets.trace_interval_s` (the
+continuous-trace loop config) and `traces.method` (which engine produced
+the row). They are deliberately not in `probes`/`rollup` - a trace is a multi-probe event
 with its own shape, not a latency sample.
 
 ## 4. Process model

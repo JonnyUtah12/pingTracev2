@@ -400,6 +400,11 @@ TRACE_STOP_AFTER_SILENT = 10     # consecutive silent TTLs (tracepath-like)
 TRACE_PORT_BASE = 33434          # classic traceroute base port
 TRACE_TOTAL_BUDGET_S = 60.0      # hard cap for one whole trace
 TRACE_RDNS_TIMEOUT_S = 1.0       # per-hop reverse-DNS budget
+# Continuous tracing: per-target loop bounds. The per-target trace lock means
+# a slow trace simply delays the next round instead of overlapping it.
+TRACE_LOOP_DEFAULT_S = 60.0
+TRACE_LOOP_MIN_S = 5.0
+TRACE_LOOP_MAX_S = 3600.0
 
 # ICMP types/codes we translate for the UI (from the error-queue cmsg).
 _ICMP_LABELS = {
@@ -763,6 +768,7 @@ class Engine:
         self.probes_failed = 0
         self._live: dict[int, LiveState] = {}
         self._tasks: dict[int, asyncio.Task] = {}
+        self._trace_tasks: dict[int, asyncio.Task] = {}
         self._trace_locks: dict[int, asyncio.Lock] = {}
         self._wake = asyncio.Event()
         self._stopping = asyncio.Event()
@@ -779,6 +785,11 @@ class Engine:
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
+        for task in list(self._trace_tasks.values()):
+            task.cancel()
+        if self._trace_tasks:
+            await asyncio.gather(*self._trace_tasks.values(), return_exceptions=True)
+        self._trace_tasks.clear()
 
     def notify_config_changed(self) -> None:
         """Make target add/remove/edit take effect on the next supervisor tick."""
@@ -824,6 +835,14 @@ class Engine:
                 for tid in wanted:
                     if tid not in self._tasks:
                         self._tasks[tid] = asyncio.create_task(self._worker(tid), name=f"probe-{tid}")
+                wanted_trace = {tid for tid, t in wanted.items() if t.get("trace_enabled")}
+                for tid in list(self._trace_tasks):
+                    if tid not in wanted_trace:
+                        self._trace_tasks.pop(tid).cancel()
+                for tid in wanted_trace:
+                    if tid not in self._trace_tasks:
+                        self._trace_tasks[tid] = asyncio.create_task(
+                            self._trace_worker(tid), name=f"trace-{tid}")
                 if time.time() - self._last_prune >= PRUNE_INTERVAL_S:
                     self._last_prune = time.time()
                     await asyncio.to_thread(self.store.prune)
@@ -881,6 +900,30 @@ class Engine:
         if delay:
             await asyncio.sleep(delay)
 
+    # ------------------------------------------------------------ trace worker
+    async def _trace_worker(self, target_id: int) -> None:
+        """Continuous route tracing: re-run the trace on an interval until the
+        target turns it off, is disabled, or is deleted. Traces persist in the
+        traces table (newest 20), so the UI just reads the latest one."""
+        try:
+            while not self._stopping.is_set():
+                cfg = self.store.get_target(target_id)
+                if cfg is None or not cfg["enabled"] or not cfg.get("trace_enabled"):
+                    break
+                try:
+                    await self.run_trace(target_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass  # a failed round is just a missing round; next one follows
+                interval = float(cfg.get("trace_interval_s") or TRACE_LOOP_DEFAULT_S)
+                interval = max(TRACE_LOOP_MIN_S, min(TRACE_LOOP_MAX_S, interval))
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._trace_tasks.pop(target_id, None)
+
     # ----------------------------------------------------------------- readout
     def snapshot(self) -> dict:
         targets = self.store.list_targets()
@@ -910,6 +953,8 @@ class Engine:
                 "proto": t["proto"],
                 "interval_s": float(t["interval_s"]),
                 "enabled": bool(t["enabled"]),
+                "trace_enabled": bool(t.get("trace_enabled")),
+                "trace_interval_s": float(t.get("trace_interval_s") or TRACE_LOOP_DEFAULT_S),
                 "status": status,
                 "last_rtt_ms": last,
                 "avg_rtt_ms": None if not s1m or s1m["avg"] is None else round(s1m["avg"], 3),

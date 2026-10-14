@@ -557,6 +557,7 @@ body.is-paused #clock { color: var(--warn); }
 .trace-bar-fill.trace-ok { background: color-mix(in srgb, var(--ok) 75%, transparent); }
 .trace-bar-fill.trace-warn { background: color-mix(in srgb, var(--warn) 75%, transparent); }
 .trace-bar-fill.trace-bad { background: color-mix(in srgb, var(--bad) 75%, transparent); }
+.card.is-tracing { outline: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: -1px; }
 .trace-bar-max {
   position: absolute; top: 1px; bottom: 1px; width: 2px;
   background: var(--text-dim); opacity: .6;

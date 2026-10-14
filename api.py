@@ -57,6 +57,8 @@ class TargetPatch(BaseModel):
     interval_s: float | None = None
     enabled: bool | None = None
     label: str | None = None
+    trace_enabled: bool | None = None
+    trace_interval_s: float | None = None
 
 
 def _resolution(store: database.Store, from_ms: int, to_ms: int, bucket_ms: int) -> dict:
@@ -223,6 +225,17 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
             fields["label"] = _clean_label(body.label)
         if body.enabled is not None:
             fields["enabled"] = bool(body.enabled)
+        if body.trace_enabled is not None:
+            fields["trace_enabled"] = bool(body.trace_enabled)
+            fields["trace_interval_s"] = float(
+                body.trace_interval_s if body.trace_interval_s is not None
+                else (cur.get("trace_interval_s") or engine_mod.TRACE_LOOP_DEFAULT_S))
+        elif body.trace_interval_s is not None:
+            fields["trace_interval_s"] = float(body.trace_interval_s)
+        if "trace_interval_s" in fields:
+            fields["trace_interval_s"] = max(engine_mod.TRACE_LOOP_MIN_S,
+                                            min(engine_mod.TRACE_LOOP_MAX_S,
+                                                fields["trace_interval_s"]))
         row = store.update_target(target_id, **fields)
         eng.notify_config_changed()
         return {"target": row}

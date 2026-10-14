@@ -54,6 +54,18 @@ hop and the return path *from* it; return paths can differ (asymmetric
 routing). The last trace per target is kept (newest 20) and readable via
 `GET /api/targets/{id}/trace`.
 
+### Continuous tracing
+
+Each card also has a **trace loop** switch: turn it on and PingTrace keeps
+re-running the route trace for that target until you turn it off — pick how
+often (30s, 1m, 5m, 15m, 1h). Every target runs its own loop independently,
+so you can watch the full path to several targets at once; the card's trace
+panel refreshes itself as new rounds land, and the card gets a highlighted
+outline while a loop is active. Loops survive restarts (the setting is
+saved with the target), never overlap for the same target, and stop when
+the target is disabled or deleted. Each round is stored like a manual trace,
+so `GET /api/targets/{id}/traces` shows the recent history.
+
 ## Where state lives
 
 Everything stays inside the folder: `metrics.db` (+ WAL sidecars),

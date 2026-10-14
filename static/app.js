@@ -656,6 +656,8 @@
     if (current && !opts.includes(current)) { opts.push(current); opts.sort((a, b) => a - b); }
     return opts.length ? opts : [5];
   }
+  const CTRACE_OPTIONS = [30, 60, 300, 900, 3600];
+
   function optionList(values, selected) {
     return values.map((v) => '<option value="' + v + '"' + (v === selected ? ' selected' : '') + '>' + v + 's</option>').join('');
   }
@@ -671,6 +673,8 @@
         '<div class="card-actions">' +
           '<label class="switch switch-sm" title="enable or disable probing"><input type="checkbox" data-action="enabled">enabled</label>' +
           '<select class="mini-select" data-action="interval" title="probe interval"></select>' +
+          '<label class="switch switch-sm" title="keep re-running the route trace until turned off"><input type="checkbox" data-action="ctrace">trace loop</label>' +
+          '<select class="mini-select" data-action="ctrace-interval" title="how often to re-run the route trace"></select>' +
           '<button type="button" class="btn btn-sm" data-action="trace" title="trace the hop-by-hop route to this target and back">trace route</button>' +
           '<button type="button" class="btn btn-icon" data-action="delete" title="delete target">✕</button>' +
         '</div>' +
@@ -703,6 +707,10 @@
     sel.innerHTML = optionList(intervalOptions(t.interval_s), t.interval_s);
     const enabled = root.querySelector('[data-action="enabled"]');
     enabled.checked = t.enabled !== false;
+    const ctrace = root.querySelector('[data-action="ctrace"]');
+    ctrace.checked = t.trace_enabled === true;
+    const ctsel = root.querySelector('[data-action="ctrace-interval"]');
+    ctsel.innerHTML = optionList(CTRACE_OPTIONS, Number(t.trace_interval_s) || 60);
     el['targets'].appendChild(root);
     c = { root: root, fields: fields, cache: {} };
     cards.set(t.id, c);
@@ -723,10 +731,12 @@
     c.root.classList.toggle('is-degraded', status === 'degraded');
     c.root.classList.toggle('is-disabled', t.enabled === false);
     c.root.classList.toggle('is-unknown', status === 'unknown');
+    c.root.classList.toggle('is-tracing', t.trace_enabled === true);
     setField(c, 'pill', status);
     if (c.fields.pill) c.fields.pill.className = 'pill status-' + status;
     setField(c, 'host', targetName(t));
     setField(c, 'meta', (t.proto || '?').toUpperCase() + ' · every ' + fmtDuration(t.interval_s) +
+      (t.trace_enabled ? ' · trace loop every ' + fmtDuration(Number(t.trace_interval_s) || 60) : '') +
       (t.label ? ' · ' + t.host + (t.port ? ':' + t.port : '') : ''));
     setField(c, 'last', fmtMs(t.last_rtt_ms));
     setField(c, 'avg', fmtMs(t.avg_rtt_ms));
@@ -750,6 +760,14 @@
     }
     const enabled = c.root.querySelector('[data-action="enabled"]');
     if (enabled && enabled.checked !== (t.enabled !== false)) enabled.checked = t.enabled !== false;
+    const ctrace = c.root.querySelector('[data-action="ctrace"]');
+    if (ctrace && ctrace.checked !== (t.trace_enabled === true)) ctrace.checked = t.trace_enabled === true;
+    const ctsel = c.root.querySelector('[data-action="ctrace-interval"]');
+    if (ctsel && Number(ctsel.value) !== Number(t.trace_interval_s)) {
+      ctsel.innerHTML = optionList(CTRACE_OPTIONS, Number(t.trace_interval_s) || 60);
+      ctsel.value = String(Number(t.trace_interval_s) || 60);
+    }
+    if (t.trace_enabled) maybeRefreshLoopTrace(c, t);
   }
 
   function localTime(iso) {
@@ -797,6 +815,21 @@
         setFormStatus((e.target.checked ? 'enabled ' : 'disabled ') + targetName(t.target), 'ok');
         applyTarget(t.target);
         kick('live');
+      } else if (action === 'ctrace') {
+        const t = await api('/api/targets/' + id, { method: 'PATCH', body: { trace_enabled: e.target.checked } });
+        const c = cards.get(id);
+        if (c) { c.traceFetchAt = 0; c.lastTraceId = null; }
+        setFormStatus(e.target.checked
+          ? 'continuous tracing on for ' + targetName(t.target) + ' — first round starts now'
+          : 'continuous tracing stopped for ' + targetName(t.target), 'ok');
+        applyTarget(t.target);
+        kick('live');
+      } else if (action === 'ctrace-interval') {
+        const value = Number(e.target.value);
+        const t = await api('/api/targets/' + id, { method: 'PATCH', body: { trace_interval_s: value } });
+        setFormStatus('trace loop set to every ' + value + 's', 'ok');
+        applyTarget(t.target);
+        kick('live');
       }
     } catch (err) {
       setFormStatus('update failed: ' + err.message, 'err');
@@ -837,6 +870,24 @@
   });
 
   /* ------------------------------ route tracing -------------------------- */
+  /* Continuous tracing: the engine loop writes a new trace row per round;
+     the card just reads the newest one, throttled, and re-renders on change. */
+  async function maybeRefreshLoopTrace(c, t) {
+    const now = Date.now();
+    if (c.traceFetchAt && now - c.traceFetchAt < 5000) return;
+    c.traceFetchAt = now;
+    try {
+      const data = await api('/api/targets/' + t.id + '/trace');
+      const tr = data && data.trace;
+      if (!tr) return;
+      const tid = tr.trace_id || tr.id;
+      if (c.lastTraceId === tid) return;
+      c.lastTraceId = tid;
+      const out = c.root.querySelector('.trace-out');
+      if (out) { out.hidden = false; renderTrace(out, tr); }
+    } catch (err) { /* next round will try again */ }
+  }
+
   async function runTraceFor(btn) {
     const root = btn.closest('.card');
     if (!root) return;
@@ -850,6 +901,8 @@
     try {
       const data = await api('/api/targets/' + id + '/trace', { method: 'POST' });
       renderTrace(out, data.trace);
+      const c = cards.get(id);
+      if (c) c.lastTraceId = data.trace.trace_id;
     } catch (err) {
       out.innerHTML = '<p class="trace-error">trace failed: ' + esc(err.message) + '</p>';
     } finally {
