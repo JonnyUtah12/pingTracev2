@@ -14,7 +14,14 @@ if not exist ".pingtrace.pid" (
 )
 
 set "PID="
-set /p PID=<.pingtrace.pid
+rem for /f, not set /p: the pid file is written in text mode, so on Windows
+rem its lines end CRLF, and set /p leaves a trailing CR inside %PID%. That
+rem made taskkill fail with "incorrect parameter" while stop.bat still
+rem reported success (CI run 38507185701: server kept answering after
+rem stop.bat). for /f strips the CR; the guard keeps only the first line.
+for /f "usebackq tokens=1 delims=" %%P in (".pingtrace.pid") do (
+    if not defined PID set "PID=%%P"
+)
 if not defined PID (
     echo [pingtrace] .pingtrace.pid is empty or unreadable.
     exit /b 1
@@ -23,7 +30,10 @@ if not defined PID (
 taskkill /pid %PID% >nul 2>nul
 set /a TRIES=0
 :wait
-tasklist /fi "PID eq %PID%" 2>nul | find "%PID%" >nul
+rem findstr, not find: when stop.bat is invoked from a Git Bash/MSYS shell,
+rem PATH contains GNU find, which treats the pattern as a filename and fails,
+rem making the wait/force-kill branch below unreachable (CI run 38507185701).
+tasklist /fi "PID eq %PID%" 2>nul | findstr /c:"%PID%" >nul
 if errorlevel 1 goto :cleanup
 set /a TRIES+=1
 if %TRIES% GEQ 8 goto :force
