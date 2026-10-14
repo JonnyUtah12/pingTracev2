@@ -188,6 +188,178 @@ async def probe_udp(host: str, port: int, timeout: float) -> ProbeOutcome:
                 pass
 
 
+# ------------------------------------------------------------------- ICMP echo
+#
+# Real ICMP echo probes - still without raw sockets or admin rights:
+#
+#   POSIX   - unprivileged "ping sockets" (SOCK_DGRAM + IPPROTO_ICMP[_V6]),
+#             the mechanism /bin/ping uses on modern Linux. The kernel
+#             rewrites the ICMP id to the socket's local port and
+#             demultiplexes replies per socket. Requires
+#             net.ipv4.ping_group_range to cover our gid (the default on
+#             modern distros); if it does not, the probe reports a clear
+#             permission error instead of pretending to work.
+#   Windows - the IP Helper API (IcmpSendEcho2 / Icmp6SendEcho2 from
+#             iphlpapi.dll), the same call ping.exe uses; works for
+#             standard users with no elevation.
+#
+# The blocking platform call runs in a worker thread; the async wrapper keeps
+# the ProbeOutcome contract of probe_tcp/probe_udp.
+
+ICMP_PAYLOAD = b"PINGTRACE!" * 2  # 20 bytes of echo data, like ping.exe's default
+
+
+def _icmp_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return (~s) & 0xFFFF
+
+
+def _is_v6(addr: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET6, addr)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _icmp_probe_posix(addr: str, timeout: float) -> ProbeOutcome:
+    v6 = _is_v6(addr)
+    family = socket.AF_INET6 if v6 else socket.AF_INET
+    proto = socket.IPPROTO_ICMPV6 if v6 else socket.IPPROTO_ICMP
+    etype, rtype = (128, 129) if v6 else (8, 0)
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM, proto)
+    except PermissionError:
+        # ping_group_range does not cover our gid: say so, don't guess.
+        return ProbeOutcome(False, None, "icmp-not-permitted")
+    except OSError as exc:
+        return ProbeOutcome(False, None, _classify(exc))
+    try:
+        hdr = struct.pack("!BBHHH", etype, 0, 0, 0, 1)
+        csum = _icmp_checksum(hdr + ICMP_PAYLOAD)
+        pkt = hdr[:2] + struct.pack("!H", csum) + hdr[4:] + ICMP_PAYLOAD
+        sockaddr = (addr, 0) if not v6 else (addr, 0, 0, 0)
+        t0 = time.perf_counter()
+        sock.sendto(pkt, sockaddr)
+        ident = sock.getsockname()[1]  # the kernel rewrote our id to this
+        while True:  # ignore anything not addressed to us until the deadline
+            remaining = timeout - (time.perf_counter() - t0)
+            if remaining <= 0:
+                return ProbeOutcome(False, None, "no-reply")
+            sock.settimeout(remaining)
+            try:
+                data = sock.recv(1024)
+            except OSError:
+                return ProbeOutcome(False, None, "no-reply")
+            if len(data) < 8:
+                continue
+            itype, icode, _c, rid, _seq = struct.unpack("!BBHHH", data[:8])
+            if rid != ident:
+                continue
+            if itype == rtype:
+                return ProbeOutcome(True, round((time.perf_counter() - t0) * 1000.0, 3))
+            label = _ICMP_LABELS.get((itype, icode), f"icmp-{itype}-{icode}")
+            return ProbeOutcome(False, None, label)
+    except OSError as exc:
+        return ProbeOutcome(False, None, _classify(exc))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+# IP Helper status codes (IcmpSendEcho2 reply buffer) worth naming.
+_IP_STATUS_LABELS = {1: "buffer-too-small", 3: "icmp-unreachable",
+                     4: "ttl-expired", 5: "no-reply", 6: "no-reply",
+                     8: "data-too-big", 11050: "unreachable"}
+
+
+def _icmp_probe_windows(addr: str, timeout: float) -> ProbeOutcome:
+    import ctypes
+    from ctypes import wintypes
+
+    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    iphlpapi.IcmpCreateFile.restype = ctypes.c_void_p  # the exported name is IcmpCreateFile
+    iphlpapi.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+    handle = iphlpapi.IcmpCreateFile()  # NULL/INVALID_HANDLE_VALUE rejected by IcmpSendEcho2
+    if not handle or handle == 0xFFFFFFFFFFFFFFFF:
+        return ProbeOutcome(False, None, "ip-helper-create-failed")
+    v6 = _is_v6(addr)
+    reply_len = 64 + len(ICMP_PAYLOAD)
+    buf = ctypes.create_string_buffer(reply_len)
+    ms = max(1, int(timeout * 1000))
+    t0 = time.perf_counter()
+    try:
+        if not v6:
+            # IcmpSendEcho(handle, destAddr, request, reqSize, options,
+            # replyBuffer, replySize, timeoutMs). On current Windows the
+            # IcmpSendEcho2 export consumes ten parameters (Ex-style), which
+            # faults under ctypes nine-arg marshalling; the legacy synchronous
+            # entry point is the stable one, and we are on a worker thread.
+            iphlpapi.IcmpSendEcho.restype = wintypes.DWORD
+            iphlpapi.IcmpSendEcho.argtypes = [
+                ctypes.c_void_p, wintypes.DWORD, ctypes.c_char_p, wintypes.WORD,
+                ctypes.c_void_p, ctypes.c_void_p, wintypes.WORD, wintypes.DWORD]
+            dest = int.from_bytes(socket.inet_aton(addr), "big")
+            n = iphlpapi.IcmpSendEcho(handle, dest, ICMP_PAYLOAD,
+                                      len(ICMP_PAYLOAD), None, buf, reply_len, ms)
+            status_off = 4  # ICMP_ECHO_REPLY: Address(4) Status(4) RoundTripTime(4)
+        else:
+            class SOCKADDR_IN6(ctypes.Structure):
+                _fields_ = [("sin6_family", ctypes.c_ushort), ("sin6_port", wintypes.WORD),
+                            ("sin6_flowinfo", wintypes.DWORD),
+                            ("sin6_addr", ctypes.c_ubyte * 16),
+                            ("sin6_scope_id", wintypes.DWORD)]
+
+            def in6(a: str) -> "SOCKADDR_IN6":
+                sa = SOCKADDR_IN6()
+                sa.sin6_family = socket.AF_INET6
+                sa.sin6_addr[:] = socket.inet_pton(socket.AF_INET6, a)
+                return sa
+
+            # Icmp6SendEcho2(handle, event, srcAddr, dstAddr, request, reqSize,
+            #                options, replyBuffer, replySize, timeoutMs).
+            iphlpapi.Icmp6SendEcho2.restype = wintypes.DWORD
+            iphlpapi.Icmp6SendEcho2.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(SOCKADDR_IN6),
+                ctypes.POINTER(SOCKADDR_IN6), ctypes.c_char_p, wintypes.WORD,
+                ctypes.c_void_p, ctypes.c_void_p, wintypes.WORD, wintypes.DWORD]
+            src, dst = in6("::"), in6(addr)
+            n = iphlpapi.Icmp6SendEcho2(handle, None, ctypes.byref(src),
+                                        ctypes.byref(dst), ICMP_PAYLOAD,
+                                        len(ICMP_PAYLOAD), None, buf, reply_len, ms)
+            status_off = 20  # ICMPV6_ECHO_REPLY: Address(16) Reserved(4) Status(4)
+    finally:
+        iphlpapi.IcmpCloseHandle(handle)
+    if n == 0:
+        # No reply reached us: timeout, or the send itself failed.
+        err = ctypes.get_last_error()
+        if err in (11010, 11050):  # IP_REQ_NOT_SENT / IP_GENERAL_FAILURE
+            return ProbeOutcome(False, None, "no-reply")
+        return ProbeOutcome(False, None, f"ip-helper-{err}")
+    status, _rtt = struct.unpack_from("<II", buf.raw, status_off)
+    if status == 0:
+        return ProbeOutcome(True, round((time.perf_counter() - t0) * 1000.0, 3))
+    return ProbeOutcome(False, None, _IP_STATUS_LABELS.get(status, f"ip-status-{status}"))
+
+
+async def probe_icmp(addr: str, timeout: float) -> ProbeOutcome:
+    fn = _icmp_probe_windows if sys.platform == "win32" else _icmp_probe_posix
+    try:
+        # wait_for is the watchdog: even if the platform call ignores its
+        # timeout, the probe loop never stalls behind a stuck thread.
+        return await asyncio.wait_for(asyncio.to_thread(fn, addr, timeout), timeout + 2.0)
+    except asyncio.TimeoutError:
+        return ProbeOutcome(False, None, "no-reply")
+    except Exception:  # a broken platform call is a probe failure, never a crash
+        return ProbeOutcome(False, None, "icmp-probe-error")
+
+
 async def run_probe(host: str, port: int, proto: str, timeout: float,
                     resolver: Resolver | None = None) -> ProbeOutcome:
     """Resolve (cached) then probe the literal address so DNS time is excluded."""
@@ -197,6 +369,8 @@ async def run_probe(host: str, port: int, proto: str, timeout: float,
         return ProbeOutcome(False, None, reason or "dns-failure")
     if proto == "udp":
         return await probe_udp(addr, port, timeout)
+    if proto == "icmp":
+        return await probe_icmp(addr, timeout)
     return await probe_tcp(addr, port, timeout)
 
 
@@ -588,7 +762,7 @@ class Engine:
                     break
                 state.host = cfg["host"]
                 interval = float(cfg["interval_s"])
-                proto = cfg["proto"] if cfg["proto"] in ("tcp", "udp") else "tcp"
+                proto = cfg["proto"] if cfg["proto"] in ("tcp", "udp", "icmp") else "tcp"
                 outcome = await run_probe(cfg["host"], int(cfg["port"]), proto,
                                          self.settings.timeout_s, self.resolver)
                 ts = database.now_ms()

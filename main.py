@@ -385,7 +385,8 @@ def main(argv=None) -> int:
         targets_path = targets_file_path(settings)
         save_targets(targets_path, store.list_targets())
         print(f"[pingtrace] {len(rows)} target(s) from {source}: "
-              + ", ".join(f"{r['host']}:{r['port']}/{r['proto']}" for r in rows))
+              + ", ".join((f"{r['host']} (icmp)" if r['proto'] == 'icmp'
+                          else f"{r['host']}:{r['port']}/{r['proto']}") for r in rows))
 
         one_shot = run_github_one_shot(settings, store)
         if one_shot is not None:

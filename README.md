@@ -1,8 +1,8 @@
 # PingTrace
 
 Portable, no-admin multi-target latency monitor for Windows. One folder, one
-exe, one localhost port: it probes a list of hosts (TCP/UDP connect probes and
-the system `ping.exe` - never a raw socket, so no elevation), stores history in
+exe, one localhost port: it probes a list of hosts (TCP/UDP connect probes
+and real ICMP echo - never a raw socket, so no elevation), stores history in
 a local SQLite file, and serves a dashboard at `http://127.0.0.1:8765/`.
 Design contract: `ARCHITECTURE.md`.
 
@@ -37,10 +37,9 @@ run). Each entry:
   "interval_s": 5.0, "label": "LAN gateway", "enabled": true }
 ```
 
-`proto` is `tcp` or `udp` (connect probes, port usually 443); `interval_s` is
-1-300. A target with no open probe port shows `down` under the TCP probe even
-when ICMP would answer - that is the no-admin trade-off, see ARCHITECTURE.md
-section 2.
+`proto` is `tcp`, `udp` (connect probes, port usually 443) or `icmp` (real
+ICMP echo - no port needed, works even when no port is open); `interval_s` is
+1-300. All three run without elevation - see ARCHITECTURE.md section 2.
 
 ## Route tracing
 

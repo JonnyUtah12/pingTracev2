@@ -33,13 +33,23 @@ target (`proto` column in `targets`):
    port; zero privileges.
 2. **UDP datagram probe** — send a datagram, wait for any reply or an
    ICMP port-unreachable. Useful for hosts with no open TCP port (DNS, QUIC).
-3. **System `ping.exe` fallback** — spawns the OS ping binary and parses the
-   reply time. `ping.exe` is available to standard users on Windows, so this
-   is the path that yields a true ICMP RTT without elevation.
+3. **ICMP echo probe (v1.2)** — a real ping, still without a raw socket:
+   POSIX unprivileged *ping sockets* (`SOCK_DGRAM` + `IPPROTO_ICMP`, the
+   mechanism `/bin/ping` uses; needs `net.ipv4.ping_group_range` to cover
+   our gid, the default on modern distros) or the Windows *IP Helper API*
+   (`IcmpSendEcho`/`Icmp6SendEcho2` from `iphlpapi.dll`, the same family
+   `ping.exe` uses). Pitfall found on Windows Server 2025: the exported
+   `IcmpSendEcho2` consumes more parameters than the documented nine and
+   faults under ctypes no matter how you marshal them; the legacy
+   synchronous `IcmpSendEcho` is the stable entry point, and we call it
+   from a worker thread anyway. Earlier revisions of this document listed
+   a "spawn the system ping.exe" strategy; it was never implemented in
+   `engine.py` - v1.2 is the first true ICMP path, and it runs in-process.
 
 Consequence for the UI and the docs: a target with no open probe port shows
-`down` under the TCP probe even though ICMP would answer. The UI exposes the
-probe kind per target so the reading is not ambiguous.
+`down` under the TCP probe even though ICMP would answer - add it as `icmp`
+instead. The UI exposes the probe kind per target so the reading is not
+ambiguous.
 
 ### Route tracing (v1.1)
 

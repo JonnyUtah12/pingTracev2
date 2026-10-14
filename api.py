@@ -169,22 +169,29 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
     def add_target(body: TargetCreate):
         try:
             host = config.normalize_host(body.host)
-            port = config.normalize_port(body.port if body.port is not None else settings.probe_port)
             interval = config.clamp_interval(body.interval_s if body.interval_s is not None
                                             else settings.interval_s)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         proto = (body.proto or "tcp").lower()
-        if proto not in ("tcp", "udp"):
-            raise HTTPException(status_code=400, detail="proto must be 'tcp' or 'udp'")
+        if proto not in ("tcp", "udp", "icmp"):
+            raise HTTPException(status_code=400, detail="proto must be 'tcp', 'udp' or 'icmp'")
+        try:
+            # ICMP echo has no port; store 0 so the UNIQUE(host,port,proto) key stays honest.
+            port = 0 if proto == "icmp" else config.normalize_port(
+                body.port if body.port is not None else settings.probe_port)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         row = store.add_target(host, port, proto, interval, _clean_label(body.label))
-        store.add_event(row["id"], host, "added", f"{proto}/{port} every {interval}s")
+        store.add_event(row["id"], host, "added",
+                        f"{proto} every {interval}s" if proto == "icmp" else f"{proto}/{port} every {interval}s")
         eng.notify_config_changed()
         return {"target": row}
 
     @app.patch("/api/targets/{target_id}")
     def patch_target(target_id: int, body: TargetPatch):
-        if store.get_target(target_id) is None:
+        cur = store.get_target(target_id)
+        if cur is None:
             raise HTTPException(status_code=404, detail="no such target")
         fields: dict = {}
         if body.host is not None:
@@ -204,9 +211,14 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
                 raise HTTPException(status_code=400, detail=str(exc))
         if body.proto is not None:
             proto = body.proto.lower()
-            if proto not in ("tcp", "udp"):
-                raise HTTPException(status_code=400, detail="proto must be 'tcp' or 'udp'")
+            if proto not in ("tcp", "udp", "icmp"):
+                raise HTTPException(status_code=400, detail="proto must be 'tcp', 'udp' or 'icmp'")
             fields["proto"] = proto
+            if proto == "icmp":
+                fields["port"] = 0  # echo probes have no port
+        if fields.get("proto", cur["proto"]) != "icmp" and fields.get("port", cur["port"]) == 0:
+            # switching back from icmp to a connect probe: 0 is not a usable port
+            fields["port"] = settings.probe_port
         if body.label is not None:
             fields["label"] = _clean_label(body.label)
         if body.enabled is not None:

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS targets (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     host       TEXT NOT NULL,
     port       INTEGER NOT NULL,
-    proto      TEXT NOT NULL CHECK (proto IN ('tcp', 'udp')),
+    proto      TEXT NOT NULL CHECK (proto IN ('tcp', 'udp', 'icmp')),
     label      TEXT,
     interval_s REAL NOT NULL,
     enabled    INTEGER NOT NULL DEFAULT 1,
@@ -113,11 +113,46 @@ class Store:
         self._local = threading.local()
         self._write_lock = threading.Lock()
         with self._conn() as c:
+            try:
+                prev = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            except sqlite3.OperationalError:  # brand-new database
+                prev = None
             c.executescript(_SCHEMA)
+            if prev is not None and int(prev["value"]) < 3:
+                self._migrate_targets_allow_icmp(c)
             c.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
             c.execute("INSERT INTO meta(key, value) VALUES('app_version', ?) "
                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (config.APP_VERSION,))
+
+    @staticmethod
+    def _migrate_targets_allow_icmp(c: sqlite3.Connection) -> None:
+        """v3: widen the targets.proto CHECK to admit 'icmp'. SQLite cannot
+        change a CHECK in place, so rebuild the table (SQLite docs 18.1.2).
+        Child FKs (probes/rollup/traces) reference targets by name, so the
+        drop+rename round trip reattaches them; foreign_key_check proves it."""
+        c.executescript("""
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE targets_new (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                host       TEXT NOT NULL,
+                port       INTEGER NOT NULL,
+                proto      TEXT NOT NULL CHECK (proto IN ('tcp', 'udp', 'icmp')),
+                label      TEXT,
+                interval_s REAL NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE (host, port, proto)
+            );
+            INSERT INTO targets_new (id, host, port, proto, label, interval_s, enabled, created_at)
+                SELECT id, host, port, proto, label, interval_s, enabled, created_at FROM targets;
+            DROP TABLE targets;
+            ALTER TABLE targets_new RENAME TO targets;
+        """)
+        bad = c.execute("PRAGMA foreign_key_check").fetchone()
+        c.execute("PRAGMA foreign_keys=ON")
+        if bad is not None:
+            raise RuntimeError(f"v3 migration left a dangling reference: {tuple(bad)}")
 
     # ---------------------------------------------------------------- plumbing
     def _conn(self) -> sqlite3.Connection:

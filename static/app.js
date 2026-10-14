@@ -1059,6 +1059,13 @@
     if (matched) setFormStatus('check the highlighted field', 'err');
   }
 
+  // ICMP echo has no port: grey the field out so the form reads honestly.
+  el['f-proto'].addEventListener('change', () => {
+    const icmp = el['f-proto'].value === 'icmp';
+    el['f-port'].disabled = icmp;
+    if (icmp) fieldError('port', '');
+  });
+
   el['add-form'].addEventListener('submit', async (e) => {
     e.preventDefault();
     clearFieldErrors();
@@ -1072,7 +1079,9 @@
     if (!host) { fieldError('host', 'host is required'); bad = true; }
     else if (!validHost(host)) { fieldError('host', 'not a valid hostname or IPv4/IPv6 address'); bad = true; }
     let port = null;
-    if (portRaw !== '') {
+    if (proto === 'icmp') {
+      port = null;  // ICMP echo has no port; the server stores 0
+    } else if (portRaw !== '') {
       port = Number(portRaw);
       if (!Number.isInteger(port) || port < 1 || port > 65535) { fieldError('port', 'port must be an integer between 1 and 65535'); bad = true; }
     } else if (proto === 'tcp' || proto === 'udp') {
