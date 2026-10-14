@@ -858,6 +858,19 @@
     }
   }
 
+  // Fixed latency bands for the hop bars, mirroring the green/amber/red
+  // reading of classic path monitors. The bar scale itself adapts to the
+  // worst hop on the path, but the colour zones stay put.
+  const TRACE_WARN_MS = 100;
+  const TRACE_CRIT_MS = 300;
+
+  function hopBand(avgMs) {
+    if (avgMs === null) return 'silent';
+    if (avgMs >= TRACE_CRIT_MS) return 'bad';
+    if (avgMs >= TRACE_WARN_MS) return 'warn';
+    return 'ok';
+  }
+
   function renderTrace(out, tr) {
     if (!tr || !Array.isArray(tr.hops)) {
       out.innerHTML = '<p class="trace-error">trace returned no hops</p>';
@@ -870,22 +883,74 @@
         tr.hops.length + ' hop(s) that did';
     let html = '<p class="trace-head">' + head +
       ' <span class="trace-meta">' + fmtMs(tr.duration_ms) + ' · ' + esc(tr.method || '') + '</span></p>';
-    html += '<table class="trace-table"><thead><tr><th>hop</th><th>address</th>' +
-      '<th>rtt 1</th><th>rtt 2</th><th>rtt 3</th><th>reply</th></tr></thead><tbody>';
-    tr.hops.forEach((h) => {
+
+    // Per-hop stats: average of the probes that answered, and the worst.
+    const stats = tr.hops.map((h) => {
+      const sent = (h.rtt_ms || []).length;
+      const rs = (h.rtt_ms || []).filter((r) => typeof r === 'number');
+      if (!rs.length) return { avg: null, max: null, lost: 0, sent: 0 };
+      return {
+        avg: rs.reduce((a, b) => a + b, 0) / rs.length,
+        max: Math.max(...rs),
+        lost: sent - rs.length,
+        sent: sent,
+      };
+    });
+    const peak = Math.max(...stats.map((s) => s.max || 0));
+    // Scale to the actual path, rounded up to a readable tick; colour zones
+    // stay at their fixed ms positions even when they fall off-scale.
+    const raw = Math.max(peak * 1.15, 5);
+    const scaleLabel = raw <= 100 ? Math.ceil(raw / 5) * 5 : Math.ceil(raw / 50) * 50;
+    const scale = scaleLabel;
+    const pct = (ms) => Math.max(0, Math.min(100, (ms / scale) * 100));
+
+    html += '<table class="trace-table"><thead><tr>' +
+      '<th class="c-hop">hop</th><th>address</th><th class="c-avg">avg</th>' +
+      '<th class="c-bar"><span>latency</span><span class="trace-scale">0</span>' +
+      '<span class="trace-scale trace-scale-max">' + scaleLabel + ' ms</span></th>' +
+      '</tr></thead><tbody>';
+    tr.hops.forEach((h, i) => {
+      const s = stats[i];
+      const band = hopBand(s.avg);
+      const title = (h.answered || 0) + '/' + s.sent + ' probes · via ' +
+        (h.via || 'no reply');
+      const badge = '<span class="trace-hop trace-' + band + '" title="' +
+        esc(title) + '">' + esc(h.ttl) + '</span>';
       const addr = h.ip
-        ? esc(h.ip) + (h.hostname ? ' <span class="trace-name">' + esc(h.hostname) + '</span>' : '')
-        : '·';
-      const rtts = [0, 1, 2].map((i) => {
-        const r = (h.rtt_ms || [])[i];
-        return '<td class="mono">' + (r === null || r === undefined ? '·' : fmtMs(r)) + '</td>';
-      }).join('');
+        ? '<span class="trace-ip">' + esc(h.ip) + '</span>' +
+          (h.hostname ? ' <span class="trace-name" title="' + esc(h.hostname) +
+            '">' + esc(h.hostname) + '</span>' : '')
+        : '<span class="trace-silent">·</span>';
+      const avg = s.avg === null
+        ? '<span class="trace-silent">·</span>'
+        : fmtMs(s.avg) + (s.lost ? '<span class="trace-loss" title="' + s.lost +
+            ' of ' + s.sent + ' probes lost"> ×' + s.lost + '</span>' : '');
+      let bar = '';
+      if (s.avg !== null) {
+        bar = '<div class="trace-bar" style="--zone-warn:' + pct(TRACE_WARN_MS).toFixed(1) +
+          '%;--zone-crit:' + pct(TRACE_CRIT_MS).toFixed(1) + '%">' +
+          '<span class="trace-bar-fill trace-' + band + '" style="width:' +
+          pct(s.avg).toFixed(1) + '%"></span>' +
+          (s.max > s.avg * 1.05 ? '<span class="trace-bar-max" style="left:' +
+            pct(s.max).toFixed(1) + '%"></span>' : '') +
+          '</div>';
+      }
       html += '<tr' + (h.final ? ' class="trace-final"' : '') + '>' +
-        '<td class="mono">' + esc(h.ttl) + '</td>' +
-        '<td class="mono">' + addr + '</td>' + rtts +
-        '<td>' + esc(h.via || (h.answered ? 'answered' : 'no reply')) + '</td></tr>';
+        '<td class="c-hop">' + badge + '</td>' +
+        '<td>' + addr + '</td>' +
+        '<td class="c-avg mono trace-avg trace-' + band + '">' + avg + '</td>' +
+        '<td class="c-bar">' + bar + '</td></tr>';
     });
     html += '</tbody></table>';
+
+    // Round-trip summary, like the reference tools put under the table.
+    const finalIdx = tr.hops.findIndex((h) => h.final);
+    const shown = finalIdx >= 0 ? stats[finalIdx]
+      : stats.reduce((acc, s) => (s.avg !== null ? s : acc), null);
+    const footLabel = finalIdx >= 0 ? 'round trip' : 'last answering hop';
+    const footValue = shown && shown.avg !== null ? fmtMs(shown.avg) : 'no reply';
+    html += '<div class="trace-foot"><span>' + footLabel + '</span>' +
+      '<span class="mono">' + footValue + '</span></div>';
     html += '<p class="trace-note">' + esc(tr.note || '') + '</p>';
     out.innerHTML = html;
   }
