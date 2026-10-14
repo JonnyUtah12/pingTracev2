@@ -41,6 +41,32 @@ Consequence for the UI and the docs: a target with no open probe port shows
 `down` under the TCP probe even though ICMP would answer. The UI exposes the
 probe kind per target so the reading is not ambiguous.
 
+### Route tracing (v1.1)
+
+The same no-raw-socket constraint governs the on-demand traceroute
+(`engine.trace_route`): for each TTL 1..N it sends a UDP datagram at the
+classic traceroute port base (33434) and reads the ICMP error that comes
+back. Two platform paths, chosen at import time, never by config:
+
+1. **POSIX** - `IP_RECVERR` + `recvmsg(MSG_ERRQUEUE)` (the `tracepath`
+   mechanism). The error cmsg carries a `sock_extended_err` plus an
+   "offender" `sockaddr` naming the router that answered. Note: on recent
+   kernels (observed on 7.0) ICMP Time Exceeded is *not* surfaced as a
+   plain socket error on UDP sockets - only port-unreachable is - so the
+   plain connected-socket trick is not enough here; the error queue is.
+2. **Windows** - connected UDP socket with `IP_TTL`; the stack reports any
+   ICMP error as `WSAECONNRESET` on `recv()` and `getpeername()` then
+   returns the ICMP error source. This is the standard unprivileged Windows
+   traceroute technique.
+
+Honesty rules baked into the result: one probe per TTL, extra probes only for
+hops that answered; silent hops are kept as `*` rows rather than dropped; the
+result carries a `note` that each hop proves the outbound path *to* that
+router and the return path *from* it (return paths can differ - asymmetric
+routing). Traces are on-demand only (a dashboard button + `POST
+/api/targets/{id}/trace`); nothing periodic runs. Results persist in the
+`traces` table, newest 20 per target.
+
 ## 3. Data model
 
 `targets` (host, port, proto, interval, enabled) → `probes` (raw, 1s
@@ -49,6 +75,11 @@ count, failures, min/avg/max RTT, jitter). `database.py` answers history
 queries by choosing raw vs rollup on the requested window, so a 30-day query
 never scans raw rows. Packet loss is `failures / probes` per bucket; jitter is
 the mean absolute RTT delta between consecutive successful probes.
+
+`traces` (schema v2) holds on-demand route traces: one row per run with the
+hop list as JSON, newest 20 per target kept, cascaded on target delete. They
+are deliberately not in `probes`/`rollup` - a trace is a multi-probe event
+with its own shape, not a latency sample.
 
 ## 4. Process model
 

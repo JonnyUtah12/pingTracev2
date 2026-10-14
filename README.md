@@ -42,6 +42,18 @@ run). Each entry:
 when ICMP would answer - that is the no-admin trade-off, see ARCHITECTURE.md
 section 2.
 
+## Route tracing
+
+Every target card has a **trace route** button: PingTrace walks TTLs 1..30
+with UDP probes and lists every hop that answers — address, reverse-DNS name,
+and per-probe round-trip times — ending at the destination or at the last
+router that replied. This needs no admin rights and no raw sockets (see
+`ARCHITECTURE.md` §2). Silent hops are shown as `·` rather than hidden, and
+each row is that router's own reply: it proves the outbound path *to* that
+hop and the return path *from* it; return paths can differ (asymmetric
+routing). The last trace per target is kept (newest 20) and readable via
+`GET /api/targets/{id}/trace`.
+
 ## Where state lives
 
 Everything stays inside the folder: `metrics.db` (+ WAL sidecars),

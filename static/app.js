@@ -671,6 +671,7 @@
         '<div class="card-actions">' +
           '<label class="switch switch-sm" title="enable or disable probing"><input type="checkbox" data-action="enabled">enabled</label>' +
           '<select class="mini-select" data-action="interval" title="probe interval"></select>' +
+          '<button type="button" class="btn btn-sm" data-action="trace" title="trace the hop-by-hop route to this target and back">trace route</button>' +
           '<button type="button" class="btn btn-icon" data-action="delete" title="delete target">✕</button>' +
         '</div>' +
       '</div>' +
@@ -681,7 +682,8 @@
         metric('consec. fails', 'consec') + metric('last probe', 'lastprobe') +
       '</div>' +
       '<div class="loss-bar" title="packet loss"><div class="loss-fill" data-f="lossfill"></div>' +
-      '<span class="loss-text mono" data-f="loss">0.0%</span></div>';
+      '<span class="loss-text mono" data-f="loss">0.0%</span></div>' +
+      '<div class="trace-out" data-f="traceout" hidden></div>';
   }
   function metric(k, f) {
     return '<div class="metric"><span class="metric-k">' + k + '</span>' +
@@ -804,6 +806,8 @@
   });
 
   el['targets'].addEventListener('click', async (e) => {
+    const traceBtn = e.target.closest('[data-action="trace"]');
+    if (traceBtn) { runTraceFor(traceBtn); return; }
     const btn = e.target.closest('[data-action="delete"]');
     if (!btn) return;
     const root = e.target.closest('.card');
@@ -831,6 +835,60 @@
       setFormStatus('delete failed: ' + err.message, 'err');
     }
   });
+
+  /* ------------------------------ route tracing -------------------------- */
+  async function runTraceFor(btn) {
+    const root = btn.closest('.card');
+    if (!root) return;
+    const id = Number(root.dataset.id);
+    const out = root.querySelector('.trace-out');
+    if (!out || btn.dataset.busy === '1') return;
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    out.hidden = false;
+    out.innerHTML = '<p class="trace-note">tracing route — up to 30 hops, a few seconds…</p>';
+    try {
+      const data = await api('/api/targets/' + id + '/trace', { method: 'POST' });
+      renderTrace(out, data.trace);
+    } catch (err) {
+      out.innerHTML = '<p class="trace-error">trace failed: ' + esc(err.message) + '</p>';
+    } finally {
+      btn.dataset.busy = '';
+      btn.disabled = false;
+    }
+  }
+
+  function renderTrace(out, tr) {
+    if (!tr || !Array.isArray(tr.hops)) {
+      out.innerHTML = '<p class="trace-error">trace returned no hops</p>';
+      return;
+    }
+    const dest = esc(tr.dest_ip || '');
+    const head = tr.reached
+      ? 'route to ' + dest + ' — destination reached, ' + tr.hops.length + ' hop(s)'
+      : 'route to ' + dest + ' — destination did not answer; showing the ' +
+        tr.hops.length + ' hop(s) that did';
+    let html = '<p class="trace-head">' + head +
+      ' <span class="trace-meta">' + fmtMs(tr.duration_ms) + ' · ' + esc(tr.method || '') + '</span></p>';
+    html += '<table class="trace-table"><thead><tr><th>hop</th><th>address</th>' +
+      '<th>rtt 1</th><th>rtt 2</th><th>rtt 3</th><th>reply</th></tr></thead><tbody>';
+    tr.hops.forEach((h) => {
+      const addr = h.ip
+        ? esc(h.ip) + (h.hostname ? ' <span class="trace-name">' + esc(h.hostname) + '</span>' : '')
+        : '·';
+      const rtts = [0, 1, 2].map((i) => {
+        const r = (h.rtt_ms || [])[i];
+        return '<td class="mono">' + (r === null || r === undefined ? '·' : fmtMs(r)) + '</td>';
+      }).join('');
+      html += '<tr' + (h.final ? ' class="trace-final"' : '') + '>' +
+        '<td class="mono">' + esc(h.ttl) + '</td>' +
+        '<td class="mono">' + addr + '</td>' + rtts +
+        '<td>' + esc(h.via || (h.answered ? 'answered' : 'no reply')) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    html += '<p class="trace-note">' + esc(tr.note || '') + '</p>';
+    out.innerHTML = html;
+  }
 
   function applyTarget(t) {
     if (!t || t.id === undefined) return;

@@ -5,6 +5,7 @@ Layout:
   probes    - raw per-probe results, kept for RAW_WINDOW_HOURS
   rollup    - 60s aggregates for data older than that window
   events    - up/down transitions and target add/remove audit trail
+  traces    - on-demand route traces (hop lists as JSON), newest kept
 
 Raw rows are rolled up and deleted so a 1s probe interval over 7 days stays a
 few MB instead of hundreds of MB. Recent data (what the live graph shows) is
@@ -12,6 +13,7 @@ always exact.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -20,7 +22,7 @@ from datetime import datetime, timezone
 
 import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -66,9 +68,23 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_ix ON events (id DESC);
+
+CREATE TABLE IF NOT EXISTS traces (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    host        TEXT NOT NULL,
+    dest_ip     TEXT,
+    created_at  TEXT NOT NULL,
+    reached     INTEGER NOT NULL,
+    hop_count   INTEGER NOT NULL,
+    duration_ms INTEGER,
+    hops_json   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS traces_ix ON traces (target_id, id DESC);
 """
 
 MAX_EVENTS_KEPT = 5000
+MAX_TRACES_KEPT_PER_TARGET = 20
 
 
 def now_ms() -> int:
@@ -174,6 +190,7 @@ class Store:
             cur = c.execute("DELETE FROM targets WHERE id=?", (target_id,))
             c.execute("DELETE FROM probes WHERE target_id=?", (target_id,))
             c.execute("DELETE FROM rollup WHERE target_id=?", (target_id,))
+            c.execute("DELETE FROM traces WHERE target_id=?", (target_id,))
         return cur.rowcount > 0
 
     def seed_targets(self, hosts, port: int, interval_s: float) -> list[dict]:
@@ -195,6 +212,51 @@ class Store:
         limit = max(1, min(int(limit), 500))
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))]
+
+    # ---------------------------------------------------------------- traces
+    def add_trace(self, target_id: int, host: str, result: dict) -> dict:
+        """Persist one trace result and keep only the newest per target."""
+        with self._write_lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO traces(target_id, host, dest_ip, created_at, reached, "
+                "hop_count, duration_ms, hops_json) VALUES(?,?,?,?,?,?,?,?)",
+                (target_id, host, result.get("dest_ip"), iso_utc(),
+                 1 if result.get("reached") else 0, int(result.get("hop_count") or 0),
+                 int(result.get("duration_ms") or 0), json.dumps(result.get("hops") or [])))
+            new_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            c.execute("DELETE FROM traces WHERE target_id=? AND id NOT IN "
+                      "(SELECT id FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?)",
+                      (target_id, target_id, MAX_TRACES_KEPT_PER_TARGET))
+            r = c.execute("SELECT * FROM traces WHERE id=?", (new_id,)).fetchone()
+        row = self._decode_trace(self._row(r))
+        if row is None:  # the row we just inserted vanished; treat as a bug, not a silent None
+            raise RuntimeError(f"trace {new_id} missing right after insert")
+        return row
+
+    @staticmethod
+    def _decode_trace(row: dict | None) -> dict | None:
+        if row is None:
+            return None
+        row["hops"] = json.loads(row.pop("hops_json") or "[]")
+        row["reached"] = bool(row["reached"])
+        return row
+
+    def get_trace(self, trace_id: int) -> dict | None:
+        return self._decode_trace(self._row(
+            self._conn().execute("SELECT * FROM traces WHERE id=?", (trace_id,)).fetchone()))
+
+    def latest_trace(self, target_id: int) -> dict | None:
+        return self._decode_trace(self._row(
+            self._conn().execute("SELECT * FROM traces WHERE target_id=? ORDER BY id DESC LIMIT 1",
+                                 (target_id,)).fetchone()))
+
+    def list_traces(self, target_id: int, limit: int = 10) -> list[dict]:
+        """Trace summaries (no hop payloads) for the history dropdown."""
+        limit = max(1, min(int(limit), MAX_TRACES_KEPT_PER_TARGET))
+        rows = self._conn().execute(
+            "SELECT id, target_id, host, dest_ip, created_at, reached, hop_count, duration_ms "
+            "FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?", (target_id, limit)).fetchall()
+        return [{**dict(r), "reached": bool(r["reached"])} for r in rows]
 
     def lifetime_counts(self, target_ids) -> dict[int, tuple[int, int]]:
         """(total, failed) probe counts across raw + rolled-up history.

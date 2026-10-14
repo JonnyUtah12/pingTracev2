@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import select
 import socket
+import struct
+import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -196,6 +200,230 @@ async def run_probe(host: str, port: int, proto: str, timeout: float,
     return await probe_tcp(addr, port, timeout)
 
 
+# ------------------------------------------------------------------ traceroute
+#
+# Hop-by-hop path discovery without raw sockets or admin rights. For each TTL
+# 1..N we send a UDP datagram at a classic traceroute port and listen for the
+# ICMP error that comes back; the responder's address names the hop. Two
+# platform paths, same result:
+#
+#   Linux/POSIX - IP_RECVERR + MSG_ERRQUEUE (the tracepath mechanism). The
+#                 error cmsg carries a sock_extended_err plus an "offender"
+#                 sockaddr naming the router that answered.
+#   Windows     - connected UDP socket; the stack surfaces any ICMP error as
+#                 WSAECONNRESET on recv, and getpeername() then returns the
+#                 address of the ICMP error source.
+#
+# Each hop's reply proves the outbound path to that router and the return path
+# from it. Return paths can differ from the outbound path (asymmetric routing);
+# only the final hop's reply traverses the whole round trip.
+
+TRACE_MAX_HOPS = 30
+TRACE_PROBES_PER_HOP = 3         # extra probes only for hops that answered
+TRACE_STOP_AFTER_SILENT = 10     # consecutive silent TTLs (tracepath-like)
+TRACE_PORT_BASE = 33434          # classic traceroute base port
+TRACE_TOTAL_BUDGET_S = 60.0      # hard cap for one whole trace
+TRACE_RDNS_TIMEOUT_S = 1.0       # per-hop reverse-DNS budget
+
+# ICMP types/codes we translate for the UI (from the error-queue cmsg).
+_ICMP_LABELS = {
+    (11, 0): "time-exceeded", (11, 1): "time-exceeded",
+    (3, 3): "port-unreachable", (3, 0): "net-unreachable",
+    (3, 1): "host-unreachable", (3, 4): "fragmentation-needed",
+    (1, 0): "host-unreachable", (1, 1): "net-unreachable",
+}
+
+
+def _parse_errqueue_cmsg(ancdata) -> tuple[str | None, int | None, int | None]:
+    """Pull (responder_ip, icmp_type, icmp_code) out of an IP_RECVERR cmsg.
+
+    Layout (uapi linux/errqueue.h): sock_extended_err is 16 bytes
+    (u32 errno, u8 origin/type/code/pad, u32 info, u32 data) and
+    SO_EE_OFFENDER is the sockaddr right after it.
+    """
+    recverr = getattr(socket, "IP_RECVERR", 11)
+    v6_recverr = getattr(socket, "IPV6_RECVERR", 25)
+    for level, ctype, vals in ancdata:
+        if ctype not in (recverr, v6_recverr) or len(vals) < 17:
+            continue
+        icmp_type, icmp_code = vals[5], vals[6]
+        offender = vals[16:]
+        fam = struct.unpack_from("=H", offender, 0)[0]
+        try:
+            if fam == socket.AF_INET and len(offender) >= 8:
+                return socket.inet_ntop(socket.AF_INET, bytes(offender[4:8])), icmp_type, icmp_code
+            if fam == socket.AF_INET6 and len(offender) >= 24:
+                return socket.inet_ntop(socket.AF_INET6, bytes(offender[8:24])), icmp_type, icmp_code
+        except (OSError, ValueError):
+            pass
+        return None, icmp_type, icmp_code
+    return None, None, None
+
+
+def _probe_hop_errqueue(dest_ip: str, port: int, ttl: int, timeout: float):
+    """POSIX path: unconnected UDP + IP_RECVERR; the error queue names the hop.
+
+    -> (responder_ip | None, rtt_ms | None, kind) where kind is an ICMP label,
+    "udp-reply" (the destination answered with data) or "timeout".
+    """
+    v6 = ":" in dest_ip
+    sock = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if v6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVERR, 1)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVERR, 1)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        sock.sendto(b"\x00" * 16, (dest_ip, port))
+        deadline = t0 + timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return None, None, "timeout"
+            if not select.select([sock], [], [], remaining)[0]:
+                return None, None, "timeout"
+            try:
+                _data, ancdata, _flags, _addr = sock.recvmsg(
+                    1024, socket.CMSG_LEN(128), socket.MSG_ERRQUEUE)
+                ip, itype, icode = _parse_errqueue_cmsg(ancdata)
+                if ip is not None:
+                    if itype is not None and icode is not None:
+                        label = _ICMP_LABELS.get((itype, icode), f"icmp-{itype}-{icode}")
+                    else:
+                        label = "icmp-error"
+                    return ip, (time.perf_counter() - t0) * 1000.0, label
+            except OSError:
+                pass  # error queue was empty; readable must mean a real reply
+            try:
+                sock.recvfrom(1024)
+                return dest_ip, (time.perf_counter() - t0) * 1000.0, "udp-reply"
+            except OSError:
+                continue
+    finally:
+        sock.close()
+
+
+def _probe_hop_connected(dest_ip: str, port: int, ttl: int, timeout: float):
+    """Windows path: connected UDP; ICMP errors surface as WSAECONNRESET and
+    getpeername() then names the router that answered."""
+    v6 = ":" in dest_ip
+    sock = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if v6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+        sock.settimeout(timeout)
+        sock.connect((dest_ip, port))
+        t0 = time.perf_counter()
+        sock.send(b"\x00" * 16)
+        try:
+            sock.recv(1024)
+            return dest_ip, (time.perf_counter() - t0) * 1000.0, "udp-reply"
+        except (ConnectionResetError, ConnectionRefusedError):
+            try:
+                ip = sock.getpeername()[0]
+            except OSError:
+                ip = None
+            return ip, (time.perf_counter() - t0) * 1000.0, "icmp-error"
+        except TimeoutError:
+            return None, None, "timeout"
+    finally:
+        sock.close()
+
+
+def probe_hop(dest_ip: str, port: int, ttl: int, timeout: float):
+    """One TTL-limited probe; platform dispatch is the only difference."""
+    if sys.platform == "win32":
+        return _probe_hop_connected(dest_ip, port, ttl, timeout)
+    return _probe_hop_errqueue(dest_ip, port, ttl, timeout)
+
+
+_RDNS_CACHE: dict[str, tuple[float, str | None]] = {}
+
+
+def reverse_dns(ip: str, timeout: float = TRACE_RDNS_TIMEOUT_S) -> str | None:
+    """Best-effort hop name; never blocks a trace for more than `timeout`."""
+    now = time.time()
+    hit = _RDNS_CACHE.get(ip)
+    if hit and hit[0] > now:
+        return hit[1]
+    result: dict = {}
+
+    def _worker():
+        try:
+            result["name"] = socket.gethostbyaddr(ip)[0]
+        except OSError:
+            result["name"] = None
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    name = result.get("name")
+    _RDNS_CACHE[ip] = (now + 600.0, name)
+    return name
+
+
+def trace_route(dest_ip: str, max_hops: int = TRACE_MAX_HOPS,
+                probes: int = TRACE_PROBES_PER_HOP, timeout: float = 2.0,
+                resolve_names: bool = True) -> dict:
+    """Walk TTLs 1..N until the destination answers or the path goes quiet.
+
+    Returns a JSON-safe dict: dest_ip, reached, hops[] (ttl, ip, hostname,
+    rtt_ms per probe, via, final), plus method/note so the UI can be honest
+    about what a hop actually proves.
+    """
+    started = time.perf_counter()
+    hops: list[dict] = []
+    reached = False
+    silent_run = 0
+    for ttl in range(1, max(1, min(int(max_hops), TRACE_MAX_HOPS)) + 1):
+        if time.perf_counter() - started > TRACE_TOTAL_BUDGET_S:
+            break
+        rtts: list[float | None] = []
+        responder: str | None = None
+        via: str | None = None
+        # One probe per TTL; only hops that answered get the extra probes,
+        # so a quiet stretch costs one timeout per TTL, not three.
+        for n in range(max(1, int(probes))):
+            ip, rtt, kind = probe_hop(dest_ip, TRACE_PORT_BASE + ttl, ttl, timeout)
+            rtts.append(None if rtt is None else round(rtt, 3))
+            if ip is not None and responder is None:
+                responder, via = ip, kind
+            elif n == 0 and ip is None:
+                break
+        answered = sum(1 for r in rtts if r is not None)
+        hop = {
+            "ttl": ttl,
+            "ip": responder,
+            "hostname": reverse_dns(responder) if resolve_names and responder else None,
+            "rtt_ms": rtts,
+            "answered": answered,
+            "via": via,
+            "final": responder == dest_ip,
+        }
+        hops.append(hop)
+        if hop["final"]:
+            reached = True
+            break
+        silent_run = 0 if answered else silent_run + 1
+        if silent_run >= TRACE_STOP_AFTER_SILENT:
+            break
+    return {
+        "dest_ip": dest_ip,
+        "reached": reached,
+        "hops": hops,
+        "hop_count": len(hops),
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "method": "udp-ttl-connected" if sys.platform == "win32" else "udp-ttl-errqueue",
+        "note": ("each hop is that router's own reply: outbound path to it, "
+                 "return path from it; return paths can differ (asymmetric routing)"),
+    }
+
+
 @dataclass
 class LiveState:
     """Rolling in-memory view of one target for the live dashboard."""
@@ -276,6 +504,7 @@ class Engine:
         self.probes_failed = 0
         self._live: dict[int, LiveState] = {}
         self._tasks: dict[int, asyncio.Task] = {}
+        self._trace_locks: dict[int, asyncio.Lock] = {}
         self._wake = asyncio.Event()
         self._stopping = asyncio.Event()
         self._last_prune = 0.0
@@ -295,6 +524,24 @@ class Engine:
     def notify_config_changed(self) -> None:
         """Make target add/remove/edit take effect on the next supervisor tick."""
         self._wake.set()
+
+    async def run_trace(self, target_id: int) -> dict:
+        """On-demand route trace for one target: resolve, walk the TTLs in a
+        worker thread (the probes are blocking sockets), persist the result.
+        One trace at a time per target; different targets may trace together."""
+        cfg = self.store.get_target(target_id)
+        if cfg is None:
+            raise KeyError(target_id)
+        addr, reason = await self.resolver.resolve(cfg["host"])
+        if addr is None:
+            raise ValueError(reason or "dns-failure")
+        lock = self._trace_locks.setdefault(target_id, asyncio.Lock())
+        async with lock:
+            result = await asyncio.to_thread(
+                trace_route, addr, timeout=min(2.0, self.settings.timeout_s))
+            result["host"] = cfg["host"]
+            row = await asyncio.to_thread(self.store.add_trace, target_id, cfg["host"], result)
+        return {"trace_id": row["id"], "created_at": row["created_at"], **result}
 
     def live(self, target_id: int) -> LiveState:
         st = self._live.get(target_id)

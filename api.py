@@ -226,6 +226,33 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         eng.notify_config_changed()
         return {"ok": True}
 
+    # ---------------------------------------------------------------- traces
+    @app.post("/api/targets/{target_id}/trace")
+    async def run_trace(target_id: int):
+        """Run a route trace now: hop-by-hop path the packets take to this
+        target and back. Blocking probes run in a worker thread; one trace at
+        a time per target."""
+        if store.get_target(target_id) is None:
+            raise HTTPException(status_code=404, detail="no such target")
+        try:
+            result = await eng.run_trace(target_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="no such target")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"cannot resolve target: {exc}")
+        return {"trace": result}
+
+    @app.get("/api/targets/{target_id}/trace")
+    def latest_trace(target_id: int):
+        row = store.latest_trace(target_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no trace recorded for this target yet")
+        return {"trace": row}
+
+    @app.get("/api/targets/{target_id}/traces")
+    def trace_list(target_id: int, limit: int = 10):
+        return {"traces": store.list_traces(target_id, limit)}
+
     # ----------------------------------------------------------- live/history
     @app.get("/api/live")
     def live():
