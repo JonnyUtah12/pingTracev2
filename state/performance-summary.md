@@ -1,10 +1,10 @@
 # PingTrace performance summary
 
-Generated 2026-10-14T02:37:12+00:00. Window: last 60 minutes, 5-minute buckets.
+Generated 2026-10-14T02:42:15+00:00. Window: last 60 minutes, 5-minute buckets.
 
 | target | probes | avg RTT (ms) | max RTT (ms) | worst loss | lifetime probes | failures |
 |---|---|---|---|---|---|---|
-| `8.8.8.8:443 (tcp)` | 2 | 7.95 | 7.96 | 0.0% | 150 | 0 |
-| `10.255.255.1:443 (tcp)` | 2 | - | - | 100.0% | 75 | 75 |
+| `8.8.8.8:443 (tcp)` | 3 | 7.97 | 7.97 | 0.0% | 301 | 0 |
+| `10.255.255.1:443 (tcp)` | 3 | - | - | 100.0% | 151 | 151 |
 
-Database: 2055696 bytes, raw rows 225, rollup rows 0.
+Database: 3955016 bytes, raw rows 452, rollup rows 0.
