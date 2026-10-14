@@ -49,7 +49,16 @@ def fake_probe(path):
     return _probe
 
 
-def test_trace_route_stops_at_destination(monkeypatch):
+@pytest.fixture
+def socket_walk(monkeypatch):
+    """These tests fake probe_hop to pin the TTL-walk logic; on Windows
+    trace_route dispatches to tracert before probe_hop is reached, so force
+    the socket path here."""
+    monkeypatch.setattr(engine_module, "_trace_windows_tracert",
+                        lambda *a, **k: None)
+
+
+def test_trace_route_stops_at_destination(monkeypatch, socket_walk):
     dest = "93.184.216.34"
     monkeypatch.setattr(engine_module, "probe_hop", fake_probe({
         1: ("10.0.0.1", 1.0, "time-exceeded"),
@@ -64,7 +73,7 @@ def test_trace_route_stops_at_destination(monkeypatch):
     assert result["hop_count"] == 3
 
 
-def test_trace_route_stops_after_silent_run(monkeypatch):
+def test_trace_route_stops_after_silent_run(monkeypatch, socket_walk):
     dest = "93.184.216.34"
     monkeypatch.setattr(engine_module, "probe_hop", fake_probe({
         1: ("10.0.0.1", 1.0, "time-exceeded"),
@@ -77,7 +86,7 @@ def test_trace_route_stops_after_silent_run(monkeypatch):
     assert all(h["ip"] is None for h in result["hops"][2:])
 
 
-def test_trace_route_keeps_per_probe_misses(monkeypatch):
+def test_trace_route_keeps_per_probe_misses(monkeypatch, socket_walk):
     dest = "93.184.216.34"
     calls = {"n": 0}
 
@@ -154,6 +163,8 @@ def app_parts(tmp_path, monkeypatch):
         1: ("192.0.2.1", 1.0, "time-exceeded"),
         2: ("198.51.100.7", 5.0, "port-unreachable"),
     }))
+    monkeypatch.setattr(engine_module, "_trace_windows_tracert",
+                        lambda *a, **k: None)
     yield store, api_module.create_app(store, eng, settings)
     store.close()
 
@@ -194,5 +205,48 @@ def test_live_trace_localhost_reaches_destination():
     result = engine_module.trace_route("127.0.0.1", probes=1, timeout=1.0,
                                       resolve_names=False)
     assert result["reached"] is True
+    assert result["hops"][0]["ip"] == "127.0.0.1"
+    assert result["hops"][0]["final"] is True
+
+
+# ------------------------------------------------------------- tracert (Windows)
+_TRACERT_SAMPLE = """\
+Tracing route to 8.8.8.8 over a maximum of 30 hops
+
+  1     1 ms     1 ms     1 ms  192.168.1.1
+  2     *        *        *     Request timed out.
+  3    14 ms    13 ms    13 ms  8.8.8.8
+  4     *        *        *     Zeit\u00fcberschreitung der Anforderung.
+
+Trace complete.
+"""
+
+
+def test_parse_tracert_output_reads_hops_locale_safely():
+    hops = engine_module._parse_tracert_output(_TRACERT_SAMPLE)
+    assert [h["ttl"] for h in hops] == [1, 2, 3, 4]
+    assert hops[0]["ip"] == "192.168.1.1"
+    assert hops[0]["rtts"] == [1.0, 1.0, 1.0]
+    assert hops[1]["ip"] is None and hops[1]["rtts"] == []
+    assert hops[2]["ip"] == "8.8.8.8" and hops[2]["rtts"] == [14.0, 13.0, 13.0]
+    # localized silent line: no IP, no samples - still a (silent) hop
+    assert hops[3]["ip"] is None and hops[3]["rtts"] == []
+
+
+def test_parse_tracert_output_ignores_prose_lines():
+    assert engine_module._parse_tracert_output(
+        "Tracing route to 8.8.8.8 over a maximum of 30 hops\n\nTrace complete.\n") == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="tracert is Windows-only")
+def test_windows_tracert_localhost():
+    """Loopback needs no network; if the runner blocks ICMP echo entirely,
+    tracert yields no hop lines and we skip rather than fail."""
+    result = engine_module._trace_windows_tracert("127.0.0.1", 5, 1.0, False)
+    if result is None:
+        pytest.skip("this runner blocks ICMP echo (tracert produced no hops)")
+    assert result["method"] == "tracert-icmp"
+    assert result["reached"] is True
+    assert result["hops"][0]["ttl"] == 1
     assert result["hops"][0]["ip"] == "127.0.0.1"
     assert result["hops"][0]["final"] is True

@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -541,6 +543,82 @@ def reverse_dns(ip: str, timeout: float = TRACE_RDNS_TIMEOUT_S) -> str | None:
     return name
 
 
+_TRACERT_IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+_TRACERT_MS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*ms\b")
+
+
+def _parse_tracert_output(text: str) -> list[dict]:
+    """Parse tracert.exe output into hop dicts. Locale-safe: only the hop
+    number, the ms samples and the IP token are relied on; localized text
+    ("Request timed out." and its translations) simply yields no data."""
+    hops = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        ttl, rest = int(m.group(1)), m.group(2)
+        ips = _TRACERT_IP_RE.findall(rest)
+        rtts = [float(v.replace(",", ".")) for v in _TRACERT_MS_RE.findall(rest)]
+        hops.append({"ttl": ttl, "ip": ips[-1] if ips else None,
+                     "rtts": rtts[:TRACE_PROBES_PER_HOP]})
+    return hops
+
+
+def _trace_windows_tracert(dest_ip: str, max_hops: int, timeout: float,
+                          resolve_names: bool) -> dict | None:
+    """Windows route tracing via the system tracert engine.
+
+    Windows never surfaces ICMP Time Exceeded on user-mode UDP sockets (only
+    port-unreachable arrives as WSAECONNRESET, and getpeername() then names
+    the configured peer, not the router), so the POSIX errqueue trick cannot
+    see intermediate hops there. tracert.exe uses the IP Helper ICMP API
+    internally: no raw sockets, no elevation, present on every Windows.
+    """
+    started = time.perf_counter()
+    cmd = ["tracert", "-d",
+           "-h", str(max(1, min(int(max_hops), TRACE_MAX_HOPS))),
+           "-w", str(max(500, int(timeout * 1000)))]
+    if ":" not in dest_ip:
+        cmd.append("-4")
+    cmd.append(dest_ip)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", timeout=TRACE_TOTAL_BUDGET_S)
+        text = proc.stdout or ""
+    except (FileNotFoundError, OSError):
+        return None
+    except subprocess.TimeoutExpired as exc:
+        text = exc.stdout if isinstance(exc.stdout, str) else ""
+    parsed = _parse_tracert_output(text)
+    if not parsed:
+        return None
+    hops: list[dict] = []
+    reached = False
+    for h in parsed:
+        rtts = [round(r, 3) for r in h["rtts"]]
+        hop = {
+            "ttl": h["ttl"],
+            "ip": h["ip"],
+            "hostname": reverse_dns(h["ip"]) if resolve_names and h["ip"] else None,
+            "rtt_ms": rtts + [None] * (TRACE_PROBES_PER_HOP - len(rtts)),
+            "answered": len(rtts),
+            "via": "icmp-echo" if h["ip"] else None,
+            "final": h["ip"] == dest_ip,
+        }
+        reached = reached or hop["final"]
+        hops.append(hop)
+    return {
+        "dest_ip": dest_ip,
+        "reached": reached,
+        "hops": hops,
+        "hop_count": len(hops),
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "method": "tracert-icmp",
+        "note": ("hops collected by the built-in Windows tracer (ICMP echo); "
+                 "each hop is that router's own reply; return paths can differ"),
+    }
+
+
 def trace_route(dest_ip: str, max_hops: int = TRACE_MAX_HOPS,
                 probes: int = TRACE_PROBES_PER_HOP, timeout: float = 2.0,
                 resolve_names: bool = True) -> dict:
@@ -550,6 +628,13 @@ def trace_route(dest_ip: str, max_hops: int = TRACE_MAX_HOPS,
     rtt_ms per probe, via, final), plus method/note so the UI can be honest
     about what a hop actually proves.
     """
+    if sys.platform == "win32":
+        via_tracert = _trace_windows_tracert(dest_ip, max_hops, timeout,
+                                             resolve_names)
+        if via_tracert is not None:
+            return via_tracert
+        # tracert unavailable (odd install): fall through to the socket walk,
+        # which can at least still prove the last hop.
     started = time.perf_counter()
     hops: list[dict] = []
     reached = False

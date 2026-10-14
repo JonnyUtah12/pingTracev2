@@ -64,10 +64,19 @@ back. Two platform paths, chosen at import time, never by config:
    kernels (observed on 7.0) ICMP Time Exceeded is *not* surfaced as a
    plain socket error on UDP sockets - only port-unreachable is - so the
    plain connected-socket trick is not enough here; the error queue is.
-2. **Windows** - connected UDP socket with `IP_TTL`; the stack reports any
-   ICMP error as `WSAECONNRESET` on `recv()` and `getpeername()` then
-   returns the ICMP error source. This is the standard unprivileged Windows
-   traceroute technique.
+2. **Windows** - the system `tracert.exe` is run as a subprocess
+   (`tracert -d -h N -w ms <dest>`) and its output parsed. Windows never
+   surfaces ICMP Time Exceeded on user-mode UDP sockets: only
+   port-unreachable arrives as `WSAECONNRESET`, and `getpeername()` then
+   names the *configured peer*, not the router that answered - so the
+   connected-socket trick cannot see intermediate hops (v1.1 shipped that
+   wrong assumption; Windows tables came back blank). `tracert` uses the
+   IP Helper ICMP API internally: no raw sockets, no elevation, present on
+   every Windows. Parsing is locale-safe: only hop numbers, `ms` samples
+   and IP tokens are relied on; localized text ("Request timed out." and
+   translations) simply yields silent hops. If `tracert` is unavailable,
+   the engine falls back to the connected-socket walk, which can at least
+   still prove the last hop.
 
 Honesty rules baked into the result: one probe per TTL, extra probes only for
 hops that answered; silent hops are kept as `*` rows rather than dropped; the
