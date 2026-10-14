@@ -24,6 +24,38 @@ the frozen exe, and `stop.bat` on every push). The git checkout itself
 contains **no** `.exe` - do not copy the source folder and expect `run.bat`
 to work; use the release zip, or build it yourself as below.
 
+## Why Windows Defender / SmartScreen flags it (and what we do about it)
+
+`pingtrace.exe` is a PyInstaller build of this open source, produced fresh
+on every release - it is **unsigned**, so SmartScreen has no publisher and
+no download reputation for it, and Defender's heuristics are suspicious of
+PyInstaller binaries in general. That is why the browser warns about the
+zip and SmartScreen may say "Windows protected your PC".
+
+What the app already does about it:
+
+- The build is **onedir** (a normal folder of visible files), not a
+  one-file exe that unpacks itself into `%TEMP%` - that pattern is what
+  most often trips Defender's behaviour heuristics.
+- `run.bat` **removes the download mark** (Mark-of-the-Web) from the
+  folder on first run, so SmartScreen does not block the exe when you
+  launch it. The app is built from this repo on GitHub Actions; if you
+  downloaded it from the releases page, that is your source of trust.
+- If Defender's real-time scan ever quarantines the exe anyway (it
+  occasionally false-positives on PyInstaller), re-allow it from
+  *Protection history* - or add the `pingtrace` folder to exclusions.
+
+The real cure is a **code-signing certificate**. The workflow already
+supports it: set up [Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/)
+(~$10/month, needs org verification once), then create the repo variables
+`TRUSTED_SIGNING_ENDPOINT`, `TRUSTED_SIGNING_ACCOUNT_NAME`,
+`TRUSTED_SIGNING_CERT_PROFILE` and the secrets `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (an app registration with
+permission on the signing account).
+Every release build then signs `pingtrace.exe` automatically; SmartScreen
+stops blocking it and reputation builds from the first download. Until
+then, "Keep" / "Run anyway" on the prompt is safe.
+
 ## Editing targets
 
 `targets.json` next to the exe is the target list. The shipped sample monitors

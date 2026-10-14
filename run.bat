@@ -16,6 +16,15 @@ if not exist "pingtrace.exe" (
     exit /b 1
 )
 
+rem Windows tags every file that arrived by download (Mark-of-the-Web), and
+rem SmartScreen blocks unsigned exes with no download reputation on first
+rem launch. This build is produced from this repo's open source on GitHub
+rem Actions; unblock the folder once, only when the tag is present.
+if exist "pingtrace.exe:Zone.Identifier" (
+    echo [pingtrace] removing download mark so SmartScreen does not block the exe...
+    powershell -NoProfile -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse -File | Unblock-File" 2>nul
+)
+
 rem Already running on this port? Just open the browser at it.
 call :health && goto :open
 

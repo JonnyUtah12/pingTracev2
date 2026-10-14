@@ -36,6 +36,26 @@ jobs:
       - name: build portable folder
         run: powershell -ExecutionPolicy Bypass -File packaging\build_portable.ps1
 
+      # Optional code signing via Azure Trusted Signing (~$10/month, removes
+      # the SmartScreen "unknown publisher" block and builds real reputation).
+      # Enable by creating repo variables TRUSTED_SIGNING_ENDPOINT,
+      # TRUSTED_SIGNING_ACCOUNT_NAME, TRUSTED_SIGNING_CERT_PROFILE and
+      # secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (see
+      # README "Why Windows flags it"). Skipped entirely when unconfigured.
+      - name: code sign pingtrace.exe (only when signing is configured)
+        if: vars.TRUSTED_SIGNING_ACCOUNT_NAME != ''
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_CERT_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: dist/pingtrace/pingtrace.exe
+          description: PingTrace
+          description-url: https://github.com/JonnyUtah12/pingtrace
+
       - name: smoke test - frozen exe, dashboard, run.bat re-run path, stop.bat
         shell: bash
         run: |

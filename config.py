@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 
 APP_NAME = "PingTrace"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 DEFAULT_TARGETS = ("8.8.8.8", "1.1.1.1")
 DEFAULT_HTTP_PORT = 8765

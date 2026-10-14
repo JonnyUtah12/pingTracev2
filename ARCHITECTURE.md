@@ -139,6 +139,13 @@ No threads, no subprocess pool except the optional `ping.exe` fallback.
   derived from `__file__` / the executable directory.
 - PyInstaller **onedir**, not onefile: onefile unpacks to a temp dir on every
   launch, which breaks "everything stays in the folder" and slows startup.
+  It also keeps the build out of the pattern Defender's behaviour heuristics
+  flag most (self-extracting temp binaries).
+- SmartScreen: the exe is unsigned, so Windows tags it by Mark-of-the-Web
+  and blocks first launch. `run.bat` unblocks the folder once when the tag
+  is present (`pingtrace.exe:Zone.Identifier`); the durable fix is code
+  signing via Azure Trusted Signing, wired into the workflow behind repo
+  variables (skipped when unconfigured). See README "Why Windows flags it".
 - `run.bat` starts the server detached (`--no-window`), waits for
   `/api/health`, then opens the default browser at the bound port.
 - `github.json` holds the PAT and is gitignored; the token is never committed.
