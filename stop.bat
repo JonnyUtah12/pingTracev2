@@ -1,5 +1,5 @@
 @echo off
-rem Stops the PingTrace server started by run.bat. No admin rights required.
+rem Stops the pingTracev2 server started by run.bat. No admin rights required.
 rem Reads the PID from .pingtrace.pid (written by the app next to the exe),
 rem asks for a clean shutdown, waits for the PROCESS to exit, then removes the
 rem pid file. (The app exits gracefully on a shutdown signal but uvicorn

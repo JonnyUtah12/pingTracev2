@@ -1,4 +1,4 @@
-# PingTrace
+# pingTracev2
 
 Portable, no-admin multi-target latency monitor for Windows. One folder, one
 exe, one localhost port: it probes a list of hosts (TCP/UDP connect probes
@@ -8,11 +8,11 @@ Design contract: `ARCHITECTURE.md`.
 
 ## Run it (Windows)
 
-1. Download **`pingtrace-windows-x64-portable.zip`** from the
-   [latest release](https://github.com/JonnyUtah12/pingtrace/releases/latest)
-   and extract it. Copy the whole `pingtrace` folder anywhere - Documents, a
+1. Download **`pingtracev2-windows-x64-portable.zip`** from the
+   [latest release](https://github.com/JonnyUtah12/pingTracev2/releases/latest)
+   and extract it. Copy the whole `pingtracev2` folder anywhere - Documents, a
    USB stick, another PC. No installer, no registry, no admin token, **no
-   Python** - `pingtrace.exe` carries its own runtime inside the folder.
+   Python** - `pingtracev2.exe` carries its own runtime inside the folder.
 2. Double-click `run.bat` (or run it from `cmd`). It starts the server
    minimized, waits for `/api/health`, then opens your default browser.
 3. `stop.bat` stops it. Re-running `run.bat` while it is already up just
@@ -26,7 +26,7 @@ to work; use the release zip, or build it yourself as below.
 
 ## Why Windows Defender / SmartScreen flags it (and what we do about it)
 
-`pingtrace.exe` is a PyInstaller build of this open source, produced fresh
+`pingtracev2.exe` is a PyInstaller build of this open source, produced fresh
 on every release - it is **unsigned**, so SmartScreen has no publisher and
 no download reputation for it, and Defender's heuristics are suspicious of
 PyInstaller binaries in general. That is why the browser warns about the
@@ -43,7 +43,7 @@ What the app already does about it:
   downloaded it from the releases page, that is your source of trust.
 - If Defender's real-time scan ever quarantines the exe anyway (it
   occasionally false-positives on PyInstaller), re-allow it from
-  *Protection history* - or add the `pingtrace` folder to exclusions.
+  *Protection history* - or add the `pingtracev2` folder to exclusions.
 
 The real cure is a **code-signing certificate**. The workflow already
 supports it: set up [Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/)
@@ -52,7 +52,7 @@ supports it: set up [Azure Trusted Signing](https://learn.microsoft.com/azure/tr
 `TRUSTED_SIGNING_CERT_PROFILE` and the secrets `AZURE_TENANT_ID`,
 `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (an app registration with
 permission on the signing account).
-Every release build then signs `pingtrace.exe` automatically; SmartScreen
+Every release build then signs `pingtracev2.exe` automatically; SmartScreen
 stops blocking it and reputation builds from the first download. Until
 then, "Keep" / "Run anyway" on the prompt is safe.
 
@@ -75,7 +75,7 @@ ICMP echo - no port needed, works even when no port is open); `interval_s` is
 
 ## Route tracing
 
-Every target card has a **trace route** button: PingTrace walks TTLs 1..30
+Every target card has a **trace route** button: pingTracev2 walks TTLs 1..30
 with UDP probes and lists every hop that answers — address, reverse-DNS name,
 and per-probe round-trip times — ending at the destination or at the last
 router that replied. On Windows the hop walk runs through the built-in
@@ -88,7 +88,7 @@ routing). The last trace per target is kept (newest 20) and readable via
 
 ### Continuous tracing
 
-Each card also has a **trace loop** switch: turn it on and PingTrace keeps
+Each card also has a **trace loop** switch: turn it on and pingTracev2 keeps
 re-running the route trace for that target until you turn it off — pick how
 often (30s, 1m, 5m, 15m, 1h). Every target runs its own loop independently,
 so you can watch the full path to several targets at once; the card's trace
@@ -121,14 +121,14 @@ app:
     packaging/build_portable.sh        # Linux/macOS
     packaging\build_portable.ps1      # Windows
 
-Both run the PyInstaller **onedir** build (`packaging/pingtrace.spec`) and
-assemble `dist/pingtrace/` with the launchers and sample state. onefile is
+Both run the PyInstaller **onedir** build packaging/pingtracev2.spec) and
+assemble `dist/pingtracev2/` with the launchers and sample state. onefile is
 deliberately not used - it unpacks to a temp dir and breaks portability.
 
 ## Verification status
 
 The Linux onedir build was verified on the build host. The Windows path -
-`build_portable.ps1`, the frozen `pingtrace.exe`, `run.bat` (start + health
+`build_portable.ps1`, the frozen `pingtracev2.exe`, `run.bat` (start + health
 poll + browser open), the dashboard assets, and `stop.bat` - runs as a smoke
 test on a real `windows-latest` runner on every push via the
 `windows-portable` workflow; the release zip is produced by that same job.

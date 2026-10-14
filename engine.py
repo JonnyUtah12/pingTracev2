@@ -2,7 +2,7 @@
 
 Windows standard-user accounts cannot open SOCK_RAW ICMP sockets without
 elevation (that is why classic ping/tracert helpers and dpinger hit a permission
-wall). PingTrace therefore measures round-trip time with plain user-mode
+wall). pingTracev2 therefore measures round-trip time with plain user-mode
 sockets:
 
   * TCP connect probe  - time a TCP handshake to a port that answers (443/80).

@@ -1,6 +1,6 @@
-# Assemble the portable PingTrace folder on Windows (ARCHITECTURE.md section 5).
+# Assemble the portable pingTracev2 folder on Windows (ARCHITECTURE.md section 5).
 # Run from anywhere:  .\packaging\build_portable.ps1
-# Result: dist\pingtrace\ - copy that whole folder to another machine or a
+# Result: dist\pingtracev2\ - copy that whole folder to another machine or a
 # USB stick and it runs (no installer, no admin, all state inside).
 #
 # NOTE: written for Windows PowerShell 5.1+ / PowerShell 7 cmd semantics but
@@ -13,10 +13,10 @@ $py = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { $py = 'python' }
 
 Write-Output '==> pyinstaller onedir build'
-& $py -m PyInstaller --clean --noconfirm packaging\pingtrace.spec
+& $py -m PyInstaller --clean --noconfirm packaging\pingtracev2.spec
 if ($LASTEXITCODE -ne 0) { throw "pyinstaller failed with exit code $LASTEXITCODE" }
 
-$Out = Join-Path $Root 'dist\pingtrace'
+$Out = Join-Path $Root 'dist\pingtracev2'
 if (-not (Test-Path $Out)) { throw "build did not produce $Out" }
 
 Write-Output "==> assembling portable folder: $Out"

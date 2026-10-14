@@ -1,4 +1,4 @@
-"""FastAPI surface for PingTrace: JSON API + the local dashboard.
+"""FastAPI surface for pingTracev2: JSON API + the local dashboard.
 
 Everything binds to 127.0.0.1 by default; nothing is reachable from the network
 unless the user asks for it, which keeps a no-admin portable app from tripping
@@ -391,7 +391,7 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
             for ts, avg, mx, loss in series.get(t["id"], []):
                 w.writerow([database.iso_utc(ts / 1000), t["id"], t["host"], bucket_ms,
                            "" if avg is None else avg, "" if mx is None else mx, loss])
-        name = f"pingtrace-{stamp}.csv".replace(":", "").replace("-", "")
+        name = f"pingtracev2-{stamp}.csv".replace(":", "").replace("-", "")
         return PlainTextResponse(buf.getvalue(), media_type="text/csv",
                                 headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
@@ -423,7 +423,7 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
         if not os.path.exists(index_path):
-            return HTMLResponse("<h1>PingTrace</h1><p>static/index.html is missing.</p>")
+            return HTMLResponse("<h1>pingTracev2</h1><p>static/index.html is missing.</p>")
         with open(index_path, "r", encoding="utf-8") as fh:
             return HTMLResponse(fh.read())
 

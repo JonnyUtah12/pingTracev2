@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for PingTrace - onedir, flat contents (ARCHITECTURE.md section 5).
+"""PyInstaller spec for pingTracev2 - onedir, flat contents (ARCHITECTURE.md section 5).
 
-Build (from any cwd):   pyinstaller packaging/pingtrace.spec
-Output:                dist/pingtrace/   (packaging/build_portable.sh|.ps1 then
+Build (from any cwd):   pyinstaller packaging/pingtracev2.spec
+Output:                dist/pingtracev2/   (packaging/build_portable.sh|.ps1 then
                          assembles the final portable folder)
 
 Why this shape:
@@ -43,7 +43,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='pingtrace',
+    name='pingtracev2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=sys.platform != 'win32',  # strip only where binutils strip exists (Linux/macOS); Windows skips it
@@ -58,6 +58,6 @@ coll = COLLECT(
     a.datas,
     strip=sys.platform != 'win32',  # strip only where binutils strip exists (Linux/macOS); Windows skips it
     upx=False,
-    name='pingtrace',
+    name='pingtracev2',
     contents_directory='.',
 )

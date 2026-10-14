@@ -1,4 +1,4 @@
-"""SQLite history layer for PingTrace.
+"""SQLite history layer for pingTracev2.
 
 Layout:
   targets   - what to probe

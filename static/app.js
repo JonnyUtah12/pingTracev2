@@ -1,6 +1,6 @@
 'use strict';
 /* =====================================================================
-   PingTrace — network ops console frontend.
+   pingTracev2 — network ops console frontend.
    Vanilla ES2020: no frameworks, no build step, no external assets.
    Talks strictly to the fixed /api contract documented in the README.
    ===================================================================== */
@@ -1458,7 +1458,7 @@
       const text = await blob.text();
       const rows = Math.max(0, text.split('\n').filter((l) => l.length).length - 1);
       const m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
-      const filename = m ? m[1] : 'pingtrace-export.csv';
+      const filename = m ? m[1] : 'pingtracev2-export.csv';
       const href = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = href; a.download = filename; a.rel = 'noopener';

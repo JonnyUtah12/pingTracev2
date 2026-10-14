@@ -1,4 +1,4 @@
-"""Runtime configuration for PingTrace.
+"""Runtime configuration for pingTracev2.
 
 Paths are resolved relative to the executable (or this module when running from
 source) so the whole app can live on a USB stick and run from there: no admin
@@ -14,8 +14,8 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-APP_NAME = "PingTrace"
-APP_VERSION = "1.3.2"
+APP_NAME = "pingTracev2"
+APP_VERSION = "2.0.0-dev"
 
 DEFAULT_TARGETS = ("8.8.8.8", "1.1.1.1")
 DEFAULT_HTTP_PORT = 8765

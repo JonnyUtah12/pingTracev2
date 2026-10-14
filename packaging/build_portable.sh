@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assemble the portable PingTrace folder (ARCHITECTURE.md section 5).
+# Assemble the portable pingTracev2 folder (ARCHITECTURE.md section 5).
 # Run from anywhere:   packaging/build_portable.sh
-# Result: dist/pingtrace/ - copy that whole folder to another machine or a
+# Result: dist/pingtracev2/ - copy that whole folder to another machine or a
 # USB stick and it runs (no installer, no admin, all state inside).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,9 +11,9 @@ PY=".venv/bin/python"
 [ -x "$PY" ] || PY="${PYTHON:-python3}"
 
 echo "==> pyinstaller onedir build"
-"$PY" -m PyInstaller --clean --noconfirm packaging/pingtrace.spec
+"$PY" -m PyInstaller --clean --noconfirm packaging/pingtracev2.spec
 
-OUT="$ROOT/dist/pingtrace"
+OUT="$ROOT/dist/pingtracev2"
 [ -d "$OUT" ] || { echo "build did not produce $OUT" >&2; exit 1; }
 
 echo "==> assembling portable folder: $OUT"

@@ -3,7 +3,7 @@ name: windows-portable
 # Builds the portable Windows folder on a real windows-latest runner,
 # smoke-tests the frozen exe through run.bat / stop.bat, and (on a v* tag)
 # publishes the zip as a release asset. This is the only supported source of
-# pingtrace.exe - end users download the zip and need no Python.
+# pingtracev2.exe - end users download the zip and need no Python.
 
 on:
   push:
@@ -42,7 +42,7 @@ jobs:
       # TRUSTED_SIGNING_ACCOUNT_NAME, TRUSTED_SIGNING_CERT_PROFILE and
       # secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (see
       # README "Why Windows flags it"). Skipped entirely when unconfigured.
-      - name: code sign pingtrace.exe (only when signing is configured)
+      - name: code sign pingtracev2.exe (only when signing is configured)
         if: vars.TRUSTED_SIGNING_ACCOUNT_NAME != ''
         uses: Azure/artifact-signing-action@v2
         with:
@@ -52,21 +52,21 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          files: dist/pingtrace/pingtrace.exe
-          description: PingTrace
-          description-url: https://github.com/JonnyUtah12/pingtrace
+          files: dist/pingtracev2/pingtracev2.exe
+          description: pingTracev2
+          description-url: https://github.com/JonnyUtah12/pingTracev2
 
       - name: smoke test - frozen exe, dashboard, run.bat re-run path, stop.bat
         shell: bash
         run: |
           set -e
-          cd dist/pingtrace
+          cd dist/pingtracev2
           # Start the exe directly (same command run.bat uses). run.bat's cold
           # start via `start /min` cannot survive on the runner: no interactive
           # desktop, so the minimized console is destroyed when the parent cmd
           # exits (observed: health OK, then connection refused 2s later).
           # On a user desktop that window persists.
-          ./pingtrace.exe --no-window --port 8765 &
+          ./pingtracev2.exe --no-window --port 8765 &
           ok=0
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then ok=1; break; fi
@@ -96,17 +96,17 @@ jobs:
           set -e
           # Git Bash on Windows ships no `zip` (exit 127 in run 38505489132).
           # Compress-Archive is in every Windows PowerShell; -Path <dir> puts
-          # the folder itself at the zip root, so extracting gives pingtrace/.
-          # The smoke test just ran the app, so dist/pingtrace holds its
+          # the folder itself at the zip root, so extracting gives pingtracev2/.
+          # The smoke test just ran the app, so dist/pingtracev2 holds its
           # metrics.db; shipped builds must start with an empty history.
-          rm -f dist/pingtrace/metrics.db dist/pingtrace/metrics.db-shm dist/pingtrace/metrics.db-wal
-          powershell -NoProfile -Command "Compress-Archive -Path dist/pingtrace -DestinationPath pingtrace-windows-x64-portable.zip -Force"
-          ls -l pingtrace-windows-x64-portable.zip
+          rm -f dist/pingtracev2/metrics.db dist/pingtracev2/metrics.db-shm dist/pingtracev2/metrics.db-wal
+          powershell -NoProfile -Command "Compress-Archive -Path dist/pingtracev2 -DestinationPath pingtracev2-windows-x64-portable.zip -Force"
+          ls -l pingtracev2-windows-x64-portable.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pingtrace-windows-x64-portable
-          path: pingtrace-windows-x64-portable.zip
+          name: pingtracev2-windows-x64-portable
+          path: pingtracev2-windows-x64-portable.zip
 
       - name: publish release (v* tags only)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -114,6 +114,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" pingtrace-windows-x64-portable.zip \
-            --title "PingTrace $GITHUB_REF_NAME (Windows portable)" \
+          gh release create "$GITHUB_REF_NAME" pingtracev2-windows-x64-portable.zip \
+            --title "pingTracev2 $GITHUB_REF_NAME (Windows portable)" \
             --notes "Portable multi-target ping plotter for Windows 10/11 x64. Extract the zip, double-click run.bat. No installer, no admin rights, no Python."

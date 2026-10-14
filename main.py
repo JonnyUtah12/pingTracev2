@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PingTrace entry point.
+"""pingTracev2 entry point.
 
 Wires the pieces together exactly as ARCHITECTURE.md §4 specifies:
 
@@ -155,7 +155,7 @@ def acquire_pid_lock(path: str) -> tuple[bool, str]:
     """
     existing = read_pid(path)
     if existing is not None and existing != os.getpid() and pid_alive(existing):
-        return False, f"another PingTrace instance is already running (pid {existing})"
+        return False, f"another pingTracev2 instance is already running (pid {existing})"
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -165,7 +165,7 @@ def acquire_pid_lock(path: str) -> tuple[bool, str]:
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
-        return False, "another PingTrace instance claimed the pid file first"
+        return False, "another pingTracev2 instance claimed the pid file first"
     except OSError as exc:
         return False, f"cannot write {os.path.basename(path)}: {exc}"
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -322,7 +322,7 @@ def build_github(store: database.Store, settings: config.Settings):
     if settings.github_init_repo and creds.get("repo"):
         try:
             client = github_sync.GitHubClient(creds["token"], creds["repo"])
-            info = client.ensure_repo(creds["repo"], "PingTrace monitoring state", private=True)
+            info = client.ensure_repo(creds["repo"], "pingTracev2 monitoring state", private=True)
             print(f"[pingtrace] github repo ready: {info.get('html_url', creds['repo'])}")
         except (github_sync.GitHubError, OSError) as exc:
             print(f"[pingtrace] github repo init failed: {exc}", file=sys.stderr)
