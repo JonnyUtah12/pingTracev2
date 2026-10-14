@@ -62,9 +62,12 @@ jobs:
       - name: zip portable folder
         shell: bash
         run: |
-          cd dist
-          zip -qr ../pingtrace-windows-x64-portable.zip pingtrace
-          ls -l ../pingtrace-windows-x64-portable.zip
+          set -e
+          # Git Bash on Windows ships no `zip` (exit 127 in run 38505489132).
+          # Compress-Archive is in every Windows PowerShell; -Path <dir> puts
+          # the folder itself at the zip root, so extracting gives pingtrace/.
+          powershell -NoProfile -Command "Compress-Archive -Path dist/pingtrace -DestinationPath pingtrace-windows-x64-portable.zip -Force"
+          ls -l pingtrace-windows-x64-portable.zip
 
       - uses: actions/upload-artifact@v4
         with:
