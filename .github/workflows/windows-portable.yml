@@ -40,7 +40,10 @@ jobs:
         run: |
           set -e
           cd dist/pingtrace
-          cmd /c run.bat
+          # Git Bash mangles a bare "/c" into a path (MSYS arg conversion), which
+          # starts an interactive cmd instead of running the batch file. The
+          # "//c" form survives conversion and reaches cmd.exe as "/c".
+          cmd //c run.bat
           echo "run.bat exit: $?"
           curl -sf http://127.0.0.1:8765/api/health
           echo
@@ -48,7 +51,7 @@ jobs:
           for a in /static/app.js /static/styles.css /static/vendor/chart.umd.min.js; do
             curl -sf -o /dev/null -w "$a -> %{http_code}\n" "http://127.0.0.1:8765$a"
           done
-          cmd /c stop.bat
+          cmd //c stop.bat
           echo "stop.bat exit: $?"
           sleep 2
           if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then
