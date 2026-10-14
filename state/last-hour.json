@@ -1,34 +1,34 @@
 {
-  "generated_at": "2026-10-14T02:42:15+00:00",
+  "generated_at": "2026-10-14T02:47:18+00:00",
   "window": "1h",
   "targets": [
     {
       "host": "8.8.8.8",
       "port": 443,
       "proto": "tcp",
-      "buckets": 3,
+      "buckets": 4,
       "avg_rtt_ms": 7.97,
-      "max_rtt_ms": 7.97,
+      "max_rtt_ms": 7.99,
       "worst_loss_pct": 0.0,
-      "lifetime_probes": 301,
+      "lifetime_probes": 451,
       "lifetime_failures": 0
     },
     {
       "host": "10.255.255.1",
       "port": 443,
       "proto": "tcp",
-      "buckets": 3,
+      "buckets": 4,
       "avg_rtt_ms": null,
       "max_rtt_ms": null,
       "worst_loss_pct": 100.0,
-      "lifetime_probes": 151,
-      "lifetime_failures": 151
+      "lifetime_probes": 226,
+      "lifetime_failures": 226
     }
   ],
   "db": {
-    "probes_raw": 452,
+    "probes_raw": 677,
     "rollup_rows": 0,
     "events": 3,
-    "db_size_bytes": 3955016
+    "db_size_bytes": 4226552
   }
 }
