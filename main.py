@@ -9,9 +9,11 @@ Wires the pieces together exactly as ARCHITECTURE.md §4 specifies:
 The probe workers are started by the FastAPI lifespan (``api.create_app``), not
 by this module, so the engine always lives inside the server's event loop and
 shuts down with it. Nothing here needs admin rights: the probes are plain
-user-mode TCP/UDP connects, the server binds to localhost, and every file the
-app reads or writes (``metrics.db``, ``targets.json``, ``.pingtrace.pid``) sits
-next to the executable.
+user-mode TCP/UDP connects, the server binds to localhost, and the files the
+app reads or writes (``metrics.db``, ``targets.json``, ``.pingtrace.pid``) sit
+next to the executable - or, if that folder is read-only (extracted to
+C:\\ root or Program Files), in a per-user data folder instead, so elevation
+is never required.
 
 Target selection, highest priority first:
   1. ``--targets`` on the command line (explicit beats saved state),
@@ -54,7 +56,52 @@ def targets_file_path(settings: config.Settings) -> str:
 
 
 def pid_file_path(settings: config.Settings) -> str:
-    return os.path.join(config.app_root(), PID_FILE_NAME)
+    return os.path.join(config.state_dir(), PID_FILE_NAME)
+
+
+def migrate_state_from_app_folder(settings: config.Settings) -> list[str]:
+    """One-time copy of state left behind in a read-only app folder.
+
+    Users who previously ran elevated (the old workaround) have metrics.db
+    and targets.json next to the exe. When the app now falls back to the
+    per-user state dir, carry those over - best effort, never fatal, and
+    never overwriting something that already exists at the destination.
+    """
+    root = config.app_root()
+    dest = config.state_dir()
+    if os.path.abspath(dest) == os.path.abspath(root):
+        return []
+    db_dir = os.path.dirname(os.path.abspath(settings.db_path))
+    db_name = os.path.basename(settings.db_path)
+    copied = []
+    try:
+        import shutil
+    except ImportError:  # pragma: no cover
+        return []
+    for name, dst_dir in ((db_name, db_dir), (TARGETS_FILE_NAME, dest)):
+        src = os.path.join(root, name)
+        dst = os.path.join(dst_dir, name)
+        if not os.path.isfile(src) or os.path.exists(dst):
+            continue
+        if name == db_name and not _looks_like_sqlite(src):
+            continue  # don't carry over garbage; let a fresh db be created
+        try:
+            shutil.copy2(src, dst)
+            # The source folder's ACLs don't follow the copy, but the file
+            # mode does - make sure the destination is actually writable.
+            os.chmod(dst, 0o600)
+            copied.append(name)
+        except OSError:
+            pass  # a half-migrated history is better than a crash
+    return copied
+
+
+def _looks_like_sqlite(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(15) == b"SQLite format 3"
+    except OSError:
+        return False
 
 
 # ------------------------------------------------------- single-instance guard
@@ -320,6 +367,14 @@ def main(argv=None) -> int:
         print(f"[pingtrace] not starting: {why}", file=sys.stderr)
         return 3
     atexit.register(release_pid_lock, pid_path)
+
+    state = config.state_dir()
+    if os.path.abspath(state) != os.path.abspath(config.app_root()):
+        print(f"[pingtrace] app folder is not writable - keeping state in {state} "
+              f"(move the folder somewhere writable to keep it portable)")
+        moved = migrate_state_from_app_folder(settings)
+        if moved:
+            print(f"[pingtrace] carried over from the app folder: {', '.join(moved)}")
 
     store = database.Store(settings.db_path, retention_ms=settings.retention_ms,
                           raw_window_ms=settings.raw_cutoff_ms)

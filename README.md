@@ -58,7 +58,14 @@ routing). The last trace per target is kept (newest 20) and readable via
 
 Everything stays inside the folder: `metrics.db` (+ WAL sidecars),
 `targets.json`, `github.json` (your GitHub PAT - keep it out of git),
-`.pingtrace.pid`. Nothing is written to the registry or `%APPDATA%`.
+`.pingtrace.pid`. Nothing is written to the registry.
+
+One exception, so you never need "Run as administrator": if the folder is
+read-only (extracted to `C:\` root, Program Files, etc.), the mutable state
+moves to `%LOCALAPPDATA%\PingTrace` instead - any history already in the app
+folder is carried over automatically, and the startup window says where state
+now lives. Move the folder somewhere writable to go back to fully portable
+state. `github.json` is always read from the app folder.
 
 ## Building the portable folder from source
 

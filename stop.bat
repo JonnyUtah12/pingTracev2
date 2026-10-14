@@ -8,8 +8,14 @@ rem deliberate, not a workaround for a hang.)
 setlocal
 cd /d "%~dp0"
 
-if not exist ".pingtrace.pid" (
-    echo [pingtrace] no .pingtrace.pid in this folder - nothing to stop.
+rem The pid file lives next to the exe when that folder is writable; if the
+rem app fell back to the per-user state dir (read-only install location),
+rem that is where it is. Check both.
+set "PIDFILE=%~dp0.pingtrace.pid"
+if not exist "%PIDFILE%" set "PIDFILE=%LOCALAPPDATA%\PingTrace\.pingtrace.pid"
+
+if not exist "%PIDFILE%" (
+    echo [pingtrace] no .pingtrace.pid here or in %%LOCALAPPDATA%%\PingTrace - nothing to stop.
     exit /b 1
 )
 
@@ -19,7 +25,7 @@ rem its lines end CRLF, and set /p leaves a trailing CR inside %PID%. That
 rem made taskkill fail with "incorrect parameter" while stop.bat still
 rem reported success (CI run 38507185701: server kept answering after
 rem stop.bat). for /f strips the CR; the guard keeps only the first line.
-for /f "usebackq tokens=1 delims=" %%P in (".pingtrace.pid") do (
+for /f "usebackq tokens=1 delims=" %%P in ("%PIDFILE%") do (
     if not defined PID set "PID=%%P"
 )
 if not defined PID (
@@ -44,6 +50,6 @@ goto :wait
 taskkill /f /pid %PID% >nul 2>nul
 
 :cleanup
-del /q ".pingtrace.pid" >nul 2>nul
+del /q "%PIDFILE%" >nul 2>nul
 echo [pingtrace] stopped (pid %PID%).
 exit /b 0

@@ -91,9 +91,16 @@ No threads, no subprocess pool except the optional `ping.exe` fallback.
 
 ## 5. Portability rules (hard requirements)
 
-- Every file the app reads or writes lives under the app folder:
-  `targets.json`, `github.json`, `metrics.db`, `static/`.
-- No registry, no `%APPDATA%`, no absolute paths — `config.app_root()` is
+- Mutable state (`targets.json`, `metrics.db`, `.pingtrace.pid`) lives under
+  the app folder **when that folder is writable** - the portable design and
+  the normal case. When it is not (the zip extracted to `C:\` root, Program
+  Files, or any other protected location), `config.state_dir()` falls back to
+  a per-user data dir (`%LOCALAPPDATA%\PingTrace` on Windows,
+  `$XDG_DATA_HOME/pingtrace` elsewhere) so the app *still* never needs
+  elevation; state left in the app folder is copied over once, and the
+  startup log names the location. `github.json` is config input the app
+  never writes, so it is read only from the app folder.
+- No registry, no absolute paths — `config.app_root()` is
   derived from `__file__` / the executable directory.
 - PyInstaller **onedir**, not onefile: onefile unpacks to a temp dir on every
   launch, which breaks "everything stays in the folder" and slows startup.

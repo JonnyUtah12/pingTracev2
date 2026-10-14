@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 
 APP_NAME = "PingTrace"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 DEFAULT_TARGETS = ("8.8.8.8", "1.1.1.1")
 DEFAULT_HTTP_PORT = 8765
@@ -38,6 +38,49 @@ def app_root() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_writable(dirpath: str) -> bool:
+    """Honest writability test: actually create a file (os.access lies on
+    Windows ACLs and read-only mounts)."""
+    probe = os.path.join(dirpath, ".pingtrace-write-probe")
+    try:
+        with open(probe, "w"):
+            pass
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def fallback_state_dir() -> str:
+    """Per-user writable location, used only when the app folder is not."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        return os.path.join(base, "PingTrace")
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "pingtrace")
+
+
+def state_dir() -> str:
+    """Where mutable state (metrics.db, targets.json, .pingtrace.pid) lives.
+
+    The app folder when it is writable - that is the portable design and the
+    normal case. When it is not (the zip extracted to C:\\ root, Program
+    Files, or any other protected location) fall back to a per-user directory
+    so the app still runs without elevation; main.py logs the move and copies
+    any state that was left in the app folder. If even the fallback cannot be
+    created, return the app folder and let the startup error name it.
+    """
+    root = app_root()
+    if _is_writable(root):
+        return root
+    fb = fallback_state_dir()
+    try:
+        os.makedirs(fb, exist_ok=True)
+    except OSError:
+        return root
+    return fb if _is_writable(fb) else root
 
 
 def normalize_host(raw: str) -> str:
@@ -83,7 +126,7 @@ def clamp_interval(raw) -> float:
 class Settings:
     http_host: str = "127.0.0.1"
     http_port: int = DEFAULT_HTTP_PORT
-    db_path: str = field(default_factory=lambda: os.path.join(app_root(), "metrics.db"))
+    db_path: str = field(default_factory=lambda: os.path.join(state_dir(), "metrics.db"))
     targets: tuple[str, ...] = DEFAULT_TARGETS
     interval_s: float = DEFAULT_INTERVAL_S
     probe_port: int = DEFAULT_PROBE_PORT
@@ -125,7 +168,9 @@ def parse_args(argv=None) -> Settings:
     p.add_argument("--probe-port", type=int, default=DEFAULT_PROBE_PORT,
                    help="TCP/UDP port used for connect-probes (default 443)")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="per-probe timeout in seconds")
-    p.add_argument("--db", default=None, help="path to the SQLite history file (default: ./metrics.db)")
+    p.add_argument("--db", default=None,
+                   help="path to the SQLite history file (default: metrics.db in the app "
+                        "folder, or a per-user data folder if that one is read-only)")
     p.add_argument("--retention-hours", type=float, default=DEFAULT_RETENTION_HOURS,
                    help="how long to keep history (default 168h)")
     p.add_argument("--no-window", action="store_true",
@@ -168,7 +213,7 @@ def parse_args(argv=None) -> Settings:
 
     return Settings(
         http_port=args.port,
-        db_path=os.path.abspath(args.db) if args.db else os.path.join(app_root(), "metrics.db"),
+        db_path=os.path.abspath(args.db) if args.db else os.path.join(state_dir(), "metrics.db"),
         targets=tuple(targets),
         targets_explicit=args.targets is not None,
         interval_s=clamp_interval(args.interval),

@@ -1,6 +1,8 @@
 @echo off
 rem PingTrace launcher - cmd.exe semantics, no admin rights, no install, no registry.
-rem Everything it touches lives in this folder (ARCHITECTURE.md section 5).
+rem State lives in this folder; if it is read-only the app keeps state in
+rem %LOCALAPPDATA%\PingTrace instead (ARCHITECTURE.md section 5). Either way,
+rem no elevation is ever needed.
 rem Starts the server minimized with --no-window, polls /api/health, then opens
 rem the default browser at the bound port.
 setlocal
