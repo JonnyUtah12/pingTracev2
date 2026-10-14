@@ -64,7 +64,14 @@ def test_probe_tcp_closed_port_is_a_loss_with_a_reason():
     out = asyncio.run(engine_mod.probe_tcp("127.0.0.1", _free_closed_port(), 2.0))
     assert out.ok is False
     assert out.rtt_ms is None
-    assert out.error == "port-closed"
+    if sys.platform == "win32":
+        # windows-latest CI was observed (twice) dropping SYNs to closed
+        # loopback ports instead of replying RST, so the probe times out
+        # there. The refused->port-closed classification itself stays
+        # unit-tested directly in test_classify_maps_socket_errors_to_reasons.
+        assert out.error in ("port-closed", "timeout")
+    else:
+        assert out.error == "port-closed"
 
 
 def test_probe_tcp_timeout_is_a_loss(monkeypatch):
