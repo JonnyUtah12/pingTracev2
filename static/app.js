@@ -670,14 +670,14 @@
           '<span class="card-host mono" data-f="host"></span>' +
           '<span class="card-meta mono" data-f="meta"></span>' +
         '</div>' +
-        '<div class="card-actions">' +
-          '<label class="switch switch-sm" title="enable or disable probing"><input type="checkbox" data-action="enabled">enabled</label>' +
-          '<select class="mini-select" data-action="interval" title="probe interval"></select>' +
-          '<label class="switch switch-sm" title="keep re-running the route trace until turned off"><input type="checkbox" data-action="ctrace">trace loop</label>' +
-          '<select class="mini-select" data-action="ctrace-interval" title="how often to re-run the route trace"></select>' +
-          '<button type="button" class="btn btn-sm" data-action="trace" title="trace the hop-by-hop route to this target and back">trace route</button>' +
-          '<button type="button" class="btn btn-icon" data-action="delete" title="delete target">✕</button>' +
-        '</div>' +
+      '</div>' +
+      '<div class="card-actions">' +
+        '<label class="switch switch-sm" title="enable or disable probing"><input type="checkbox" data-action="enabled">enabled</label>' +
+        '<select class="mini-select" data-action="interval" title="probe interval"></select>' +
+        '<label class="switch switch-sm" title="keep re-running the route trace until turned off"><input type="checkbox" data-action="ctrace">trace loop</label>' +
+        '<select class="mini-select" data-action="ctrace-interval" title="how often to re-run the route trace"></select>' +
+        '<button type="button" class="btn btn-sm" data-action="trace" title="trace the hop-by-hop route to this target and back">trace route</button>' +
+        '<button type="button" class="btn btn-sm btn-danger" data-action="delete" title="delete this target">delete</button>' +
       '</div>' +
       '<div class="metrics">' +
         metric('last rtt', 'last') + metric('avg', 'avg') + metric('max', 'max') +
