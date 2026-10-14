@@ -8,12 +8,21 @@ Design contract: `ARCHITECTURE.md`.
 
 ## Run it (Windows)
 
-1. Copy the whole `pingtrace` folder anywhere - Documents, a USB stick, another
-   PC. No installer, no registry, no admin token.
+1. Download **`pingtrace-windows-x64-portable.zip`** from the
+   [latest release](https://github.com/JonnyUtah12/pingtrace/releases/latest)
+   and extract it. Copy the whole `pingtrace` folder anywhere - Documents, a
+   USB stick, another PC. No installer, no registry, no admin token, **no
+   Python** - `pingtrace.exe` carries its own runtime inside the folder.
 2. Double-click `run.bat` (or run it from `cmd`). It starts the server
    minimized, waits for `/api/health`, then opens your default browser.
 3. `stop.bat` stops it. Re-running `run.bat` while it is already up just
    re-opens the browser.
+
+The zip is built automatically on a real Windows host by the
+`windows-portable` GitHub Actions workflow (it also smoke-tests `run.bat`,
+the frozen exe, and `stop.bat` on every push). The git checkout itself
+contains **no** `.exe` - do not copy the source folder and expect `run.bat`
+to work; use the release zip, or build it yourself as below.
 
 ## Editing targets
 
@@ -41,6 +50,10 @@ Everything stays inside the folder: `metrics.db` (+ WAL sidecars),
 
 ## Building the portable folder from source
 
+Only needed if you want to build the exe yourself - the release zip already
+contains a built one. Python is required **only here**, never to run the
+app:
+
     pip install -r requirements.txt
     packaging/build_portable.sh        # Linux/macOS
     packaging\build_portable.ps1      # Windows
@@ -51,8 +64,8 @@ deliberately not used - it unpacks to a temp dir and breaks portability.
 
 ## Verification status
 
-The onedir build, the frozen binary, `/api/health`, and in-folder
-`metrics.db` were verified on the Linux build host. `run.bat`, `stop.bat` and
-`build_portable.ps1` are written for cmd.exe / Windows PowerShell semantics but
-have **not been executed on a Windows host** (none was available); they are
-the first thing to try on real Windows.
+The Linux onedir build was verified on the build host. The Windows path -
+`build_portable.ps1`, the frozen `pingtrace.exe`, `run.bat` (start + health
+poll + browser open), the dashboard assets, and `stop.bat` - runs as a smoke
+test on a real `windows-latest` runner on every push via the
+`windows-portable` workflow; the release zip is produced by that same job.

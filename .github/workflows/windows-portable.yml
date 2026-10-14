@@ -1,0 +1,79 @@
+name: windows-portable
+
+# Builds the portable Windows folder on a real windows-latest runner,
+# smoke-tests the frozen exe through run.bat / stop.bat, and (on a v* tag)
+# publishes the zip as a release asset. This is the only supported source of
+# pingtrace.exe - end users download the zip and need no Python.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: tests
+        run: python -m pytest tests/ -q
+
+      - name: build portable folder
+        run: powershell -ExecutionPolicy Bypass -File packaging\build_portable.ps1
+
+      - name: smoke test - real Windows run via run.bat
+        shell: bash
+        run: |
+          set -e
+          cd dist/pingtrace
+          cmd /c run.bat
+          echo "run.bat exit: $?"
+          curl -sf http://127.0.0.1:8765/api/health
+          echo
+          curl -sf -o /dev/null -w "GET / -> %{http_code}\n" http://127.0.0.1:8765/
+          for a in /static/app.js /static/styles.css /static/vendor/chart.umd.min.js; do
+            curl -sf -o /dev/null -w "$a -> %{http_code}\n" "http://127.0.0.1:8765$a"
+          done
+          cmd /c stop.bat
+          echo "stop.bat exit: $?"
+          sleep 2
+          if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then
+            echo "FAIL: server still answering after stop.bat"; exit 1
+          fi
+          echo "port released after stop.bat: OK"
+
+      - name: zip portable folder
+        shell: bash
+        run: |
+          cd dist
+          zip -qr ../pingtrace-windows-x64-portable.zip pingtrace
+          ls -l ../pingtrace-windows-x64-portable.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pingtrace-windows-x64-portable
+          path: pingtrace-windows-x64-portable.zip
+
+      - name: publish release (v* tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" pingtrace-windows-x64-portable.zip \
+            --title "PingTrace $GITHUB_REF_NAME (Windows portable)" \
+            --notes "Portable multi-target ping plotter for Windows 10/11 x64. Extract the zip, double-click run.bat. No installer, no admin rights, no Python."

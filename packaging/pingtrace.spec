@@ -14,6 +14,7 @@ Why this shape:
   The frozen app needs zero code changes.
 """
 import os
+import sys
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
@@ -45,7 +46,7 @@ exe = EXE(
     name='pingtrace',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,  # host CPython ships an unstripped libpython (237MB of DWARF); strip during collection
+    strip=sys.platform != 'win32',  # strip only where binutils strip exists (Linux/macOS); Windows skips it
     upx=False,
     console=True,  # run.bat starts it minimized; logs stay visible for debugging
     contents_directory='.',
@@ -55,7 +56,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    strip=True,  # host CPython ships an unstripped libpython (237MB of DWARF); strip during collection
+    strip=sys.platform != 'win32',  # strip only where binutils strip exists (Linux/macOS); Windows skips it
     upx=False,
     name='pingtrace',
     contents_directory='.',
