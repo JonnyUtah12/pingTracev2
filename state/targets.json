@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-10-14T02:37:12+00:00",
+  "app": {
+    "name": "PingTrace",
+    "version": "1.0.0"
+  },
+  "defaults": {
+    "interval_s": 2.0,
+    "probe_port": 443,
+    "timeout_s": 2.0,
+    "retention_hours": 168.0
+  },
+  "targets": [
+    {
+      "host": "8.8.8.8",
+      "port": 443,
+      "proto": "tcp",
+      "label": null,
+      "interval_s": 2.0,
+      "enabled": true
+    },
+    {
+      "host": "10.255.255.1",
+      "port": 443,
+      "proto": "tcp",
+      "label": null,
+      "interval_s": 2.0,
+      "enabled": true
+    }
+  ]
+}
