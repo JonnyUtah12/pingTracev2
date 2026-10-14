@@ -1,0 +1,15 @@
+# PingTrace - pinned dependencies (verified against the build host venv:
+# Python 3.14.7 on Linux, 2026-10-13).  Install: pip install -r requirements.txt
+
+# --- runtime (the app itself; everything else is stdlib) ---
+fastapi==0.143.0
+uvicorn==0.54.0
+
+# --- build (packaging/pingtrace.spec) ---
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+
+# --- tests (python -m pytest tests/) ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1

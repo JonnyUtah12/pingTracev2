@@ -1,0 +1,18 @@
+# local, portable state — never committed
+metrics.db
+metrics.db-wal
+metrics.db-shm
+*.db
+*.db-wal
+*.db-shm
+github.json
+targets.json.bak
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+!packaging/*.spec
+.pingtrace.pid
+.pytest_cache/

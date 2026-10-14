@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>PingTrace — network ops console</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+
+<div id="banner" class="banner" role="status" hidden>
+  <span class="banner-dot" aria-hidden="true"></span>
+  <span id="banner-text" class="banner-text">disconnected from engine</span>
+  <span id="banner-meta" class="banner-meta mono"></span>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M1 13h3.4l1.8-6.2 2.9 12.4 2.6-9.2 1.7 3h7.6" fill="none" stroke="currentColor"
+            stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="brand-text">
+      <h1 class="brand-name">PingTrace</h1>
+      <p class="brand-sub">unprivileged TCP/UDP latency monitor</p>
+    </div>
+  </div>
+
+  <div class="hud">
+    <div class="hud-item" id="hud-engine" title="engine health from /api/health">
+      <span id="engine-dot" class="dot dot-unknown" aria-hidden="true"></span>
+      <div class="hud-text">
+        <span class="hud-k">engine</span>
+        <span id="engine-state" class="hud-v mono">connecting…</span>
+      </div>
+    </div>
+    <div class="hud-item" id="hud-down" title="targets the engine cannot reach — a probe problem, not an app problem">
+      <div class="hud-text">
+        <span class="hud-k">targets down</span>
+        <span id="targets-down" class="hud-v mono">0</span>
+      </div>
+    </div>
+    <div class="hud-item">
+      <div class="hud-text">
+        <span class="hud-k">probes sent</span>
+        <span id="probes-total" class="hud-v mono">0</span>
+      </div>
+    </div>
+    <div class="hud-item">
+      <div class="hud-text">
+        <span class="hud-k">probes failed</span>
+        <span id="probes-failed" class="hud-v mono">0</span>
+      </div>
+    </div>
+    <div class="hud-item">
+      <div class="hud-text">
+        <span class="hud-k">local time</span>
+        <span id="clock" class="hud-v mono">--:--:--</span>
+      </div>
+    </div>
+    <button id="btn-pause" class="btn btn-pause" type="button" aria-pressed="false"
+            title="Halt polling (p)">Pause</button>
+  </div>
+</header>
+
+<main>
+  <section class="toolbar" aria-label="graph controls">
+    <div class="seg" id="range-group" role="group" aria-label="time range">
+      <button class="seg-btn" type="button" data-range="10m">10m</button>
+      <button class="seg-btn is-on" type="button" data-range="1h">1h</button>
+      <button class="seg-btn" type="button" data-range="6h">6h</button>
+      <button class="seg-btn" type="button" data-range="24h">24h</button>
+      <button class="seg-btn" type="button" data-range="7d">7d</button>
+    </div>
+
+    <label class="switch"><input type="checkbox" id="toggle-auto" checked>auto-refresh</label>
+    <label class="switch"><input type="checkbox" id="toggle-follow" checked>follow live</label>
+    <label class="switch"><input type="checkbox" id="toggle-loss" checked>loss overlay</label>
+    <button id="btn-reset-view" class="btn btn-ghost" type="button">Reset view</button>
+    <button id="btn-search" class="btn" type="button" aria-expanded="false" aria-controls="search-panel"
+            title="search probe history by host and date range">Search</button>
+    <button id="btn-export" class="btn" type="button"
+            title="download the points plotted on the graph as CSV">Export CSV</button>
+
+    <div class="readouts">
+      <span class="readout"><span class="hud-k">bucket</span><span id="bucket-readout" class="mono">—</span></span>
+      <span class="readout"><span class="hud-k">window</span><span id="window-readout" class="mono">—</span></span>
+      <span class="readout"><span class="hud-k">points in view</span><span id="points-readout" class="mono">0</span></span>
+      <span class="readout"><span id="export-status" class="mono"></span></span>
+    </div>
+  </section>
+
+  <section id="targets" class="cards" aria-label="monitored targets"></section>
+
+  <section id="empty-state" class="empty" hidden>
+    <h2>No targets yet</h2>
+    <p>PingTrace probes TCP connect or UDP port targets without admin rights — no raw sockets, no
+      elevated privileges, nothing to install. Add a host below and the graph starts filling within
+      one probe interval.</p>
+    <ul class="empty-hints">
+      <li><span class="mono">example.com:443</span> — TCP connect time as a latency proxy</li>
+      <li><span class="mono">10.0.0.1:53</span> — IPv4 or IPv6 literal, any port</li>
+      <li>Outages render as visible gaps in the trace, not as flat lines.</li>
+    </ul>
+  </section>
+
+  <section id="chart-panel" class="panel chart-panel">
+    <div class="panel-head">
+      <h2 class="panel-title">latency trace <span class="panel-sub">ms · per target · gaps = no data · <span id="resolution-readout">resolution unknown</span> · <span id="last-data">no data yet</span></span></h2>
+      <p class="data-stale" id="data-stale" hidden></p>
+      <div id="chart-legend" class="legend" aria-label="series legend"></div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="latency-chart" aria-label="latency over time" role="img"></canvas>
+    </div>
+  </section>
+
+  <section class="panel search-panel" id="search-panel" hidden>
+    <div class="panel-head">
+      <h2 class="panel-title">search probe history
+        <span class="panel-sub">host or label + date range · rows from /api/search, graph window from /api/history/window</span>
+      </h2>
+      <button type="button" class="btn btn-icon" id="btn-search-close" title="close search">✕</button>
+    </div>
+    <form class="search-form" id="search-form" novalidate autocomplete="off">
+      <div class="field">
+        <label for="s-host">host or label <span class="opt">blank = every target</span></label>
+        <input id="s-host" type="text" spellcheck="false" placeholder="e.g. 10.0.0.1">
+      </div>
+      <div class="field">
+        <label for="s-error">failure text <span class="opt">optional</span></label>
+        <input id="s-error" type="text" spellcheck="false" placeholder="port-closed, timeout…">
+      </div>
+      <div class="field">
+        <label for="s-from">from</label>
+        <input id="s-from" type="datetime-local">
+      </div>
+      <div class="field">
+        <label for="s-to">to</label>
+        <input id="s-to" type="datetime-local">
+      </div>
+      <div class="field">
+        <label for="s-only-fail">scope</label>
+        <label class="switch" style="margin-top:2px"><input type="checkbox" id="s-only-fail">failures only</label>
+      </div>
+      <div class="form-actions">
+        <div class="seg" id="search-quick" role="group" aria-label="quick date range">
+          <button type="button" class="seg-btn" data-span="900000">15m</button>
+          <button type="button" class="seg-btn is-on" data-span="3600000">1h</button>
+          <button type="button" class="seg-btn" data-span="21600000">6h</button>
+          <button type="button" class="seg-btn" data-span="86400000">24h</button>
+        </div>
+        <button type="submit" class="btn btn-primary" id="btn-search-go">Search</button>
+        <button type="button" class="btn" id="btn-search-export" title="download the matching probe rows as CSV" disabled>Export results</button>
+        <button type="button" class="btn btn-ghost" id="btn-search-clear">Clear</button>
+        <span class="form-status" id="search-status" role="status"></span>
+      </div>
+    </form>
+    <p class="search-note" id="search-note"></p>
+    <div class="search-results" id="search-results" hidden>
+      <table class="results-table">
+        <thead><tr><th>time</th><th>target</th><th>proto</th><th>result</th><th>rtt</th></tr></thead>
+        <tbody id="search-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">add target <span class="panel-sub">focus with a</span></h2>
+      </div>
+      <form id="add-form" class="add-form" novalidate autocomplete="off">
+        <div class="field field-wide">
+          <label for="f-host">host</label>
+          <input id="f-host" name="host" type="text" placeholder="example.com or 2001:db8::1" spellcheck="false">
+          <p class="field-error" id="e-host"></p>
+        </div>
+        <div class="field">
+          <label for="f-port">port</label>
+          <input id="f-port" name="port" type="text" inputmode="numeric" value="443" placeholder="443">
+          <p class="field-error" id="e-port"></p>
+        </div>
+        <div class="field">
+          <label for="f-proto">protocol</label>
+          <select id="f-proto" name="proto">
+            <option value="tcp">TCP connect</option>
+            <option value="udp">UDP</option>
+          </select>
+          <p class="field-error" id="e-proto"></p>
+        </div>
+        <div class="field">
+          <label for="f-interval">interval</label>
+          <select id="f-interval" name="interval_s"></select>
+          <p class="field-error" id="e-interval"></p>
+        </div>
+        <div class="field field-wide">
+          <label for="f-label">label <span class="opt">optional</span></label>
+          <input id="f-label" name="label" type="text" placeholder="edge-router-a" maxlength="64">
+          <p class="field-error" id="e-label"></p>
+        </div>
+        <div class="form-actions">
+          <button id="btn-add" class="btn btn-primary" type="submit">Add target</button>
+          <span id="form-status" class="form-status" role="status"></span>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">event log <span class="panel-sub">up · down · added · removed · seeded · error</span></h2>
+      </div>
+      <div id="event-list" class="events" tabindex="0"></div>
+      <p id="events-empty" class="events-empty">no events recorded</p>
+    </section>
+  </div>
+</main>
+
+<footer class="footer">
+  <span class="foot-item"><span class="hud-k">db</span><span id="db-size" class="mono">—</span></span>
+  <span class="foot-item"><span class="hud-k">path</span><span id="db-path" class="mono">—</span></span>
+  <span class="foot-item"><span class="hud-k">retention</span><span id="retention" class="mono">—</span></span>
+  <span class="foot-item"><span class="hud-k">rows raw/rollup</span><span id="db-rows" class="mono">—</span></span>
+  <span class="foot-item"><span class="hud-k">engine</span><span id="engine-version" class="mono">—</span></span>
+  <span class="foot-note">runs from a USB stick · no installer · no admin rights · no raw sockets</span>
+</footer>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title">Confirm</h3>
+    <p id="modal-body"></p>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn btn-ghost" type="button">Cancel</button>
+      <button id="modal-ok" class="btn btn-danger" type="button">Confirm</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

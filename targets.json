@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "app": {
+    "name": "PingTrace",
+    "version": "1.0.0"
+  },
+  "targets": [
+    {
+      "host": "192.168.1.1",
+      "port": 443,
+      "proto": "tcp",
+      "interval_s": 5.0,
+      "label": "LAN gateway",
+      "enabled": true
+    },
+    {
+      "host": "8.8.8.8",
+      "port": 443,
+      "proto": "tcp",
+      "interval_s": 5.0,
+      "label": "Google DNS",
+      "enabled": true
+    },
+    {
+      "host": "1.1.1.1",
+      "port": 443,
+      "proto": "tcp",
+      "interval_s": 5.0,
+      "label": "Cloudflare DNS",
+      "enabled": true
+    },
+    {
+      "host": "github.com",
+      "port": 443,
+      "proto": "tcp",
+      "interval_s": 15.0,
+      "label": "GitHub",
+      "enabled": true
+    }
+  ]
+}
