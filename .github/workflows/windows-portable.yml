@@ -60,9 +60,9 @@ jobs:
           # run.bat with the server already up: must exit 0 without starting a
           # second instance (health probe short-circuits to opening the browser;
           # the single-instance guard is the backstop).
-          cmd /c run.bat
+          cmd //c run.bat
           echo "run.bat (already-running path) exit: $?"
-          cmd /c stop.bat
+          cmd //c stop.bat
           echo "stop.bat exit: $?"
           sleep 2
           if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then
