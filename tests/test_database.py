@@ -143,8 +143,12 @@ def test_pick_bucket_stays_on_the_ladder_and_grows_with_the_span(store):
 def test_prune_rolls_up_then_retention_drops(store):
     ids = seed_three(store)
     now = database.now_ms()
-    rollable = now - 900_000                         # older than raw window, inside retention
-    expired = now - 5_000_000                        # older than the 1h retention floor
+    # Align to the 60 s rollup grid: an unaligned 4 s span straddles a bucket
+    # boundary ~5% of the time and lands in two rollup rows instead of one.
+    # The +30 s keeps the whole span strictly inside one bucket.
+    grid = now - (now % store.rollup_bucket_ms)
+    rollable = grid - 900_000 + 30_000               # older than raw window, inside retention
+    expired = grid - 5_000_000 + 30_000              # older than the 1h retention floor
     for i in range(4):
         store.record_probe(ids[0], rollable - i * 1000, True, 15.0)
     for i in range(3):
