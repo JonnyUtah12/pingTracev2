@@ -95,8 +95,8 @@ class Settings:
     github_token: str = ""
     github_repo: str = ""
     github_branch: str = "main"
-    github_alert_loss_pct: float = 25.0
-    github_sync_minutes: int = 30
+    github_alert_loss_pct: float = -1.0   # -1 = not set on CLI; resolved from github.json
+    github_sync_minutes: int = -1         # -1 = not set on CLI; resolved from github.json
     github_init_repo: bool = False
     github_release_tag: str = ""
     github_sync_once: bool = False
@@ -134,10 +134,12 @@ def parse_args(argv=None) -> Settings:
     g.add_argument("--github-token", default=None, help="classic Personal Access Token (or set GITHUB_TOKEN)")
     g.add_argument("--github-repo", default=None, help="owner/repo to sync state and issues to")
     g.add_argument("--github-branch", default="main", help="branch for state commits (default: main)")
-    g.add_argument("--github-alert-loss", type=float, default=25.0,
-                   help="open a GitHub issue when a target exceeds this packet-loss %% over 30 min (0 disables)")
-    g.add_argument("--github-sync-minutes", type=int, default=30,
-                   help="minutes between state commits (min 5; 0 disables periodic sync)")
+    g.add_argument("--github-alert-loss", type=float, default=None,
+                   help="open a GitHub issue when a target exceeds this packet-loss %% over 30 min "
+                        "(0 disables; default: alert_loss_pct from github.json, else 25)")
+    g.add_argument("--github-sync-minutes", type=int, default=None,
+                   help="minutes between state commits (min 5; 0 disables periodic sync; "
+                        "default: sync_minutes from github.json, else 30)")
     g.add_argument("--github-init-repo", action="store_true", help="create the repository if it does not exist")
     g.add_argument("--github-release", default="", metavar="TAG",
                    help="create a release tagged TAG and exit")
@@ -177,8 +179,13 @@ def parse_args(argv=None) -> Settings:
         github_token=args.github_token or "",
         github_repo=args.github_repo or "",
         github_branch=args.github_branch,
-        github_alert_loss_pct=max(0.0, float(args.github_alert_loss)),
-        github_sync_minutes=max(0, int(args.github_sync_minutes)),
+        # -1 = "not given on the CLI"; main.build_github then resolves the value
+        # from github.json (load_credentials) or the 25/30 defaults. Explicit
+        # CLI flags keep priority over the config file.
+        github_alert_loss_pct=(-1.0 if args.github_alert_loss is None
+                               else max(0.0, float(args.github_alert_loss))),
+        github_sync_minutes=(-1 if args.github_sync_minutes is None
+                             else max(0, int(args.github_sync_minutes))),
         github_init_repo=args.github_init_repo,
         github_release_tag=(args.github_release or "").strip(),
         github_sync_once=bool(args.github_sync_once),

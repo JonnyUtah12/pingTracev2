@@ -258,6 +258,18 @@ def build_github(store: database.Store, settings: config.Settings):
         creds["token"] = settings.github_token
     if settings.github_repo:
         creds["repo"] = settings.github_repo
+    # Resolve the two tunables with priority CLI flag > github.json > default.
+    # -1 in settings means "not given on the CLI". The syncer reads
+    # alert_loss_pct from creds and api._github_loop reads
+    # settings.github_sync_minutes, so both are reconciled here.
+    if settings.github_alert_loss_pct >= 0:
+        creds["alert_loss_pct"] = settings.github_alert_loss_pct
+    else:
+        settings.github_alert_loss_pct = float(creds.get("alert_loss_pct", 25.0))
+    if settings.github_sync_minutes >= 0:
+        creds["sync_minutes"] = settings.github_sync_minutes
+    else:
+        settings.github_sync_minutes = max(0, int(creds.get("sync_minutes", 30)))
     if not creds.get("token"):
         return None
     if settings.github_init_repo and creds.get("repo"):
