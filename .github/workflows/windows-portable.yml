@@ -35,30 +35,40 @@ jobs:
       - name: build portable folder
         run: powershell -ExecutionPolicy Bypass -File packaging\build_portable.ps1
 
-      - name: smoke test - real Windows run via run.bat
+      - name: smoke test - frozen exe, dashboard, run.bat re-run path, stop.bat
         shell: bash
         run: |
           set -e
           cd dist/pingtrace
-          # Git Bash mangles a bare "/c" into a path (MSYS arg conversion), which
-          # starts an interactive cmd instead of running the batch file. The
-          # "//c" form survives conversion and reaches cmd.exe as "/c".
-          cmd //c run.bat
-          echo "run.bat exit: $?"
-          curl -sf http://127.0.0.1:8765/api/health
-          echo
+          # Start the exe directly (same command run.bat uses). run.bat's cold
+          # start via `start /min` cannot survive on the runner: no interactive
+          # desktop, so the minimized console is destroyed when the parent cmd
+          # exits (observed: health OK, then connection refused 2s later).
+          # On a user desktop that window persists.
+          ./pingtrace.exe --no-window --port 8765 &
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "FAIL: /api/health never answered"; exit 1; }
+          curl -sf http://127.0.0.1:8765/api/health; echo
           curl -sf -o /dev/null -w "GET / -> %{http_code}\n" http://127.0.0.1:8765/
           for a in /static/app.js /static/styles.css /static/vendor/chart.umd.min.js; do
             curl -sf -o /dev/null -w "$a -> %{http_code}\n" "http://127.0.0.1:8765$a"
           done
-          cmd //c stop.bat
+          # run.bat with the server already up: must exit 0 without starting a
+          # second instance (health probe short-circuits to opening the browser;
+          # the single-instance guard is the backstop).
+          cmd /c run.bat
+          echo "run.bat (already-running path) exit: $?"
+          cmd /c stop.bat
           echo "stop.bat exit: $?"
           sleep 2
           if curl -sf http://127.0.0.1:8765/api/health >/dev/null; then
             echo "FAIL: server still answering after stop.bat"; exit 1
           fi
           echo "port released after stop.bat: OK"
-
       - name: zip portable folder
         shell: bash
         run: |
@@ -66,6 +76,9 @@ jobs:
           # Git Bash on Windows ships no `zip` (exit 127 in run 38505489132).
           # Compress-Archive is in every Windows PowerShell; -Path <dir> puts
           # the folder itself at the zip root, so extracting gives pingtrace/.
+          # The smoke test just ran the app, so dist/pingtrace holds its
+          # metrics.db; shipped builds must start with an empty history.
+          rm -f dist/pingtrace/metrics.db dist/pingtrace/metrics.db-shm dist/pingtrace/metrics.db-wal
           powershell -NoProfile -Command "Compress-Archive -Path dist/pingtrace -DestinationPath pingtrace-windows-x64-portable.zip -Force"
           ls -l pingtrace-windows-x64-portable.zip
 
