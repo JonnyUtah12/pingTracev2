@@ -104,7 +104,8 @@ so a stored history entry stays self-describing.
 
 `targets` (host, port, proto, interval, enabled) → `probes` (raw, 1s
 resolution, retained `RAW_WINDOW_HOURS`) → `rollup` (per-minute aggregates:
-count, failures, min/avg/max RTT — deliberately **no jitter column**, see §4).
+count, failures, min/avg/max RTT, jitter — the jitter column arrived in
+schema v6, GAP-2).
 `database.py` answers history
 queries by choosing raw vs rollup on the requested window, so a 30-day query
 never scans raw rows. Packet loss is `failures / probes` per bucket; every
@@ -153,10 +154,17 @@ Honest notes:
   value. It is not windowed: the same value feeds every readout regardless
   of the 60 s / 600 s windows, it never resets, and it is neither persisted
   nor recomputed from history.
-- **No historical jitter exists.** The `rollup` table has no jitter column
-  (`database.py:56-65`) and `Store.history` never emits one
-  (`database.py:466-492`). Adding bucketed jitter is GAP-2 (task V2-T6, in
-  flight at the time of writing); when it lands, add its row here.
+- **Historical jitter exists since schema v6 (GAP-2).** `rollup.jitter` is
+  the mean absolute RTT delta between consecutive **successful** probes
+  *inside* the 60 s bucket — failures are skipped in the delta sequence but
+  still count in loss — and NULL when the bucket holds fewer than two
+  successes (never a fake 0). `prune()` computes it from raw rows with a
+  `LAG` window function; history buckets coarser than 60 s weight the stored
+  per-minute jitters by their delta counts (`n_ok − 1`) instead of inventing
+  cross-minute deltas, and raw-window buckets compute it from the probe rows
+  directly. Proven by `test_history_bucket_jitter_skips_failures_in_the_delta_sequence`,
+  `test_prune_stores_bucket_jitter_in_rollup_and_history_serves_it`,
+  `test_history_jitter_is_null_not_zero_for_thin_buckets`.
 - Status thresholds (`engine.py:35-37`, logic `engine.py:743-756`):
   `unknown` when no sample in the last 120 s; `down` at
   `DOWN_AFTER_FAILURES = 3` consecutive failures or 100 % loss in the 60 s
@@ -171,13 +179,14 @@ Honest notes:
 | per-bucket `avg_rtt` | `sum(ok rtt) / n_ok` | raw `probes` for the last `RAW_WINDOW_HOURS` (24 h, `config.py:28`), `rollup` beyond that | `database.py:438-464`, assembled `:486-491` |
 | per-bucket `max_rtt` | `MAX(rtt)` over ok probes | same | same |
 | per-bucket `loss_pct` | `100 × n_fail / n` | same | same; formula also stated in §3 |
-| `rollup` 60 s buckets (`config.py:29`) | `n`, `n_fail`, `AVG(ok rtt)`, `MAX/MIN(rtt)`; merged incrementally on re-insert | built at prune time from raw rows older than 24 h | `database.py:552-583` |
+| per-bucket `jitter_ms` | mean `abs(rtt_n − rtt_n−1)` over consecutive **successful** probes inside the bucket; NULL below 2 successes | raw `probes` for the last `RAW_WINDOW_HOURS`, `rollup.jitter` beyond that; coarse buckets weight stored jitters by `n_ok − 1` | `database.py` (`_raw_buckets` LAG query, `_rollup_buckets` weighted merge, `prune()` jitter CTE) |
+| `rollup` 60 s buckets (`config.py:29`) | `n`, `n_fail`, `AVG(ok rtt)`, `MAX/MIN(rtt)`, `jitter`; merged incrementally on re-insert (jitter delta-count-weighted) | built at prune time from raw rows older than 24 h | `database.py` (`prune`) |
 | bucket size | auto: ~600 points, snapped up to 1 s…1 d steps | requested range 10 m…7 d (`api.py:41`) | `database.py:429-436` (`pick_bucket`) |
 
 - Buckets with zero probes are omitted entirely so charts show a real gap
   rather than a fake flat line (`database.py:469-470`).
 - `min` is computed inside the history queries but **not served**: the
-  series point is `[ts, avg, max, loss]` and the min value is discarded
+  series point is `[ts, avg, max, loss, jitter]` and the min value is discarded
   (`database.py:486`).
 
 ### Per-hop (served by `GET /api/targets/{id}/hop-history`)
