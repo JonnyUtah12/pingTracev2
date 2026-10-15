@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 
 APP_NAME = "pingTracev2"
-APP_VERSION = "2.0.0-dev"
+APP_VERSION = "2.0.0"
 
 DEFAULT_TARGETS = ("8.8.8.8", "1.1.1.1")
 DEFAULT_HTTP_PORT = 8765
