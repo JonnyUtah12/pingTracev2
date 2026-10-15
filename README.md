@@ -56,6 +56,39 @@ Every release build then signs `pingtracev2.exe` automatically; SmartScreen
 stops blocking it and reputation builds from the first download. Until
 then, "Keep" / "Run anyway" on the prompt is safe.
 
+## Smart App Control (Windows 11)
+
+Smart App Control (SAC) is a stricter gate than SmartScreen, enabled by
+default on **clean Windows 11 installs** (upgraded machines usually do not
+have it). It only allows apps that are signed by a trusted publisher or
+have strong download reputation — and unlike SmartScreen there is **no
+per-app "Run anyway" / "Keep" button**: an unsigned exe is hard-blocked.
+
+While the Trusted Signing repo variables are unconfigured, the release
+`pingtracev2.exe` is unsigned, so on a SAC-enabled machine it will be
+blocked outright. That is expected behaviour, not a broken download.
+
+The fix is already wired into the build: once the repo variables
+`TRUSTED_SIGNING_ENDPOINT`, `TRUSTED_SIGNING_ACCOUNT_NAME`,
+`TRUSTED_SIGNING_CERT_PROFILE` and the secrets `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` are set (setup in the section
+above), the `windows-portable` workflow signs `pingtracev2.exe` with Azure
+Trusted Signing (`.github/workflows/windows-portable.yml:45-57`) and the
+signed exe passes SAC's publisher check.
+
+If you are on a SAC machine and must run an *unsigned* build (for example
+one you built yourself), the only manual path is turning Smart App Control
+off: Windows Settings → Privacy & security → Windows Security → App &
+browser control → Smart App Control settings. We do **not** recommend
+that: it lowers a system-wide protection, and once turned off it cannot be
+turned back on without reinstalling Windows. The recommended path is
+always the signed release build.
+
+One honest caveat: signing removes the SAC hard-block, but it does not
+promise zero prompts forever — SmartScreen reputation still builds from
+downloads, and SAC's decisions come from Microsoft's reputation service
+and can change.
+
 ## Editing targets
 
 `targets.json` next to the exe is the target list. The shipped sample monitors

@@ -14,7 +14,7 @@ GitHub sync. Everything below was verified against the working tree on Linux
 | Storage | SQLite (WAL) at `metrics.db` in the app folder | single file, no service, survives copy-to-another-folder |
 | Frontend | `static/index.html` + vanilla JS + vendored Chart.js | no build step, no CDN, works offline |
 | GitHub | `github_sync.py`, stdlib `urllib` against `https://api.github.com` | Classic REST API only; no PyGithub, no `gh` CLI |
-| Packaging | PyInstaller **onedir** | see §5 |
+| Packaging | PyInstaller **onedir** | see §6 |
 
 One process, one port, one folder. No service installer, no registry writes, no
 system Python, no admin token.
@@ -104,10 +104,11 @@ so a stored history entry stays self-describing.
 
 `targets` (host, port, proto, interval, enabled) → `probes` (raw, 1s
 resolution, retained `RAW_WINDOW_HOURS`) → `rollup` (per-minute aggregates:
-count, failures, min/avg/max RTT, jitter). `database.py` answers history
+count, failures, min/avg/max RTT — deliberately **no jitter column**, see §4).
+`database.py` answers history
 queries by choosing raw vs rollup on the requested window, so a 30-day query
-never scans raw rows. Packet loss is `failures / probes` per bucket; jitter is
-the mean absolute RTT delta between consecutive successful probes.
+never scans raw rows. Packet loss is `failures / probes` per bucket; every
+metric's exact formula, window, and compute site is listed in §4.
 
 `traces` (schema v2) holds route traces: one row per run with the
 hop list as JSON, newest 20 per target kept, cascaded on target delete.
@@ -116,7 +117,88 @@ continuous-trace loop config) and `traces.method` (which engine produced
 the row). They are deliberately not in `probes`/`rollup` - a trace is a multi-probe event
 with its own shape, not a latency sample.
 
-## 4. Process model
+## 4. Metrics — formula, window, where computed
+
+Every number the UI or the API shows, verified against the code at this
+revision. Two independent compute paths exist and must not be confused:
+**live** readouts come from an in-memory sample buffer (`LiveState`,
+`engine.py:692-756`), **history** readouts come from SQLite (`probes` /
+`rollup` / `hop_samples`, `database.py`). The live buffer is capped at
+`MAX_LIVE_POINTS` samples per target (`engine.py:41`, `:697`) and is empty
+after a restart; history survives restarts.
+
+### Live (served by `GET /api/live`, `Engine.snapshot`, `engine.py:928-975`)
+
+The two live windows come from `LIVE_WINDOW_S = (60.0, 600.0)`
+(`engine.py:40`).
+
+| Metric | Formula | Window | Computed at |
+|---|---|---|---|
+| `avg_rtt_ms` | mean of successful RTTs | 60 s | `engine.py:719` (served `:960`) |
+| `min_rtt_ms` | min of successful RTTs | 60 s | `engine.py:720` (served `:961`) |
+| `max_rtt_ms` | max of successful RTTs | **600 s** — deliberately longer than avg/min | `engine.py:721` (served `:962`) |
+| `loss_pct` | `100 × failed / total` probes | 60 s | `engine.py:722` (served `:964`); the bucket-side formula is the same shape, §3 |
+| `jitter_ms` | EWMA-smoothed mean absolute RTT delta between consecutive successful probes: `J ← δ` on the first pair, else `0.8·J + 0.2·δ`, with `δ = abs(rtt_n − rtt_n−1)` | none — one persistent value per target per process run | `engine.py:733-739` (served `:963`) |
+| `status` | see thresholds below | 60 s window + consecutive-failure counter | `engine.py:743-756` |
+| `last_rtt_ms`, `consecutive_failures` | raw last-probe values | none | `engine.py:730-731` |
+| `probes_total`, `probes_failed` | lifetime counts over `probes` + `rollup` | lifetime | `database.py:387-405` (served `engine.py:965-966`) |
+
+Honest notes:
+
+- **Live jitter is smoothed, and it is not RFC 3550's recurrence.** The code
+  comment says "RFC 3550 style inter-arrival jitter, smoothed"
+  (`engine.py:733`); the actual update is an EWMA with α = 0.2
+  (`engine.py:739`), where RFC 3550 §10 defines `J += (D − J)/16`
+  (α = 1/16). It is an RFC-3550-*style* smoothed jitter, not the standard's
+  value. It is not windowed: the same value feeds every readout regardless
+  of the 60 s / 600 s windows, it never resets, and it is neither persisted
+  nor recomputed from history.
+- **No historical jitter exists.** The `rollup` table has no jitter column
+  (`database.py:56-65`) and `Store.history` never emits one
+  (`database.py:466-492`). Adding bucketed jitter is GAP-2 (task V2-T6, in
+  flight at the time of writing); when it lands, add its row here.
+- Status thresholds (`engine.py:35-37`, logic `engine.py:743-756`):
+  `unknown` when no sample in the last 120 s; `down` at
+  `DOWN_AFTER_FAILURES = 3` consecutive failures or 100 % loss in the 60 s
+  window; `degraded` when 60 s loss exceeds `DEGRADED_LOSS_PCT` (0.0 —
+  *any* loss in the window) or smoothed jitter exceeds `DEGRADED_JITTER_MS`
+  (60 ms); `ok` otherwise.
+
+### History (served by `GET /api/history`, `/api/history/window`, `/api/export.csv`)
+
+| Metric | Formula | Window / resolution | Computed at |
+|---|---|---|---|
+| per-bucket `avg_rtt` | `sum(ok rtt) / n_ok` | raw `probes` for the last `RAW_WINDOW_HOURS` (24 h, `config.py:28`), `rollup` beyond that | `database.py:438-464`, assembled `:486-491` |
+| per-bucket `max_rtt` | `MAX(rtt)` over ok probes | same | same |
+| per-bucket `loss_pct` | `100 × n_fail / n` | same | same; formula also stated in §3 |
+| `rollup` 60 s buckets (`config.py:29`) | `n`, `n_fail`, `AVG(ok rtt)`, `MAX/MIN(rtt)`; merged incrementally on re-insert | built at prune time from raw rows older than 24 h | `database.py:552-583` |
+| bucket size | auto: ~600 points, snapped up to 1 s…1 d steps | requested range 10 m…7 d (`api.py:41`) | `database.py:429-436` (`pick_bucket`) |
+
+- Buckets with zero probes are omitted entirely so charts show a real gap
+  rather than a fake flat line (`database.py:469-470`).
+- `min` is computed inside the history queries but **not served**: the
+  series point is `[ts, avg, max, loss]` and the min value is discarded
+  (`database.py:486`).
+
+### Per-hop (served by `GET /api/targets/{id}/hop-history`)
+
+| Metric | Formula | Window | Computed at |
+|---|---|---|---|
+| per-hop `avg_rtt` / `max_rtt` | `AVG/MAX(rtt_ms)` over answered trace runs only — silent hops store `rtt NULL` (`hop_samples`), so a timeout never becomes a latency | requested range, hop index 1..30 | `database.py:515-533` |
+| per-hop `loss_pct` | `(probes − answered) / probes` — a hop that answered nothing in a run contributes its whole probe count to the numerator | same | same |
+
+### Trace and alert aggregates
+
+- A trace's per-hop RTT is one probe per TTL (extra probes only for hops
+  that answered) — §2; no window, one stored row per run.
+- GitHub alert/summary aggregates (`github_sync.py:218-234`): last 1 h in
+  5-minute buckets — `avg_rtt_ms` / `max_rtt_ms` are the mean/max of the
+  bucket avgs, `worst_loss_pct` is the max bucket loss, plus lifetime
+  counts. An alert requires ≥ `MIN_PROBES_FOR_ALERT = 10` probes
+  (`github_sync.py:29`, checked `:288`) and loss above `alert_loss_pct`
+  (default 25 %, `github_sync.py:56`).
+
+## 5. Process model
 
 `main.py` (entry point) wires: `config.load()` → `database.Store` →
 `store.seed_targets()` → `engine.Engine` → `api.create_app()` → `uvicorn.run`.
@@ -124,7 +206,7 @@ The engine runs as asyncio tasks inside the server loop (started in the
 FastAPI lifespan), one worker per enabled target, plus one GitHub sync loop.
 No threads, no subprocess pool except the optional `ping.exe` fallback.
 
-## 5. Portability rules (hard requirements)
+## 6. Portability rules (hard requirements)
 
 - Mutable state (`targets.json`, `metrics.db`, `.pingtrace.pid`) lives under
   the app folder **when that folder is writable** - the portable design and
@@ -146,11 +228,15 @@ No threads, no subprocess pool except the optional `ping.exe` fallback.
   is present (`pingtrace.exe:Zone.Identifier`); the durable fix is code
   signing via Azure Trusted Signing, wired into the workflow behind repo
   variables (skipped when unconfigured). See README "Why Windows flags it".
+- Smart App Control (present on clean Windows 11 installs, not on upgraded
+  machines) is stricter than SmartScreen: it hard-blocks the unsigned exe
+  with no per-app "Run anyway" override. The same signed build is the cure;
+  see README "Smart App Control".
 - `run.bat` starts the server detached (`--no-window`), waits for
   `/api/health`, then opens the default browser at the bound port.
 - `github.json` holds the PAT and is gitignored; the token is never committed.
 
-## 6. Rejected alternatives
+## 7. Rejected alternatives
 
 | Alternative | Rejected because |
 |---|---|
@@ -162,7 +248,7 @@ No threads, no subprocess pool except the optional `ping.exe` fallback.
 | A separate database (Postgres, InfluxDB) | a "portable folder you can copy to a USB stick" cannot depend on a running service |
 | A Windows service or installer | both require elevation to install and leave registry entries behind |
 
-## 7. Known gaps as of this revision
+## 8. Known gaps as of this revision
 
 Re-verified by the orchestrator at 23:00. Anything marked *closed* was open in an
 earlier revision of this document; do not re-report it as a defect.
