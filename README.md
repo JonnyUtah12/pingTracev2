@@ -106,6 +106,32 @@ run). Each entry:
 ICMP echo - no port needed, works even when no port is open); `interval_s` is
 1-300. All three run without elevation - see ARCHITECTURE.md section 2.
 
+## Target profiles
+
+A **profile** is a named target set - the equivalent of a PingPlotter
+workspace. Instead of editing one list back and forth, save the set you use
+for work, the set you use for a game server, the set you use for a customer
+site, and switch between them in one click. Profiles live inside
+`metrics.db` (no extra config files), and the dashboard has a **target
+profiles** panel for all of it:
+
+- **Save current set** - snapshot whatever is being monitored right now under
+  a name you choose.
+- **Switch** - replaces the whole monitored set in one step (with a
+  confirmation): targets outside the profile are removed together with their
+  history, targets shared with the profile keep their history and just take
+  the profile's settings, and the probes restart immediately. The swap is a
+  single database transaction - if anything fails, nothing changes.
+- **Export / Import JSON** - move a profile between installs. Import always
+  creates a new profile; it never switches by itself.
+- The active profile is remembered across restarts: after a switch, the
+  startup seed does **not** re-apply `targets.json` over it (command-line
+  `--targets` still beats everything, and clears the profile marker). The
+  `targets.json` snapshot then converges on the profile's set at the next
+  clean shutdown.
+
+Renaming a profile = export it, delete it, import it under the new name.
+
 ## Route tracing
 
 Every target card has a **trace route** button: pingTracev2 walks TTLs 1..30
@@ -160,7 +186,9 @@ a few MB:
 pin to the timeline (`add note` on the graph, or the `/api/.../annotations`
 API) are never auto-pruned - they survive every retention pass and every
 restart. A note is removed only when you delete it, or when you delete the
-target it belongs to.
+target it belongs to. Saved **target profiles** are the same kind of user
+data: never auto-pruned, removed only when you delete them from the
+profiles panel or the API.
 
 ## Building the portable folder from source
 

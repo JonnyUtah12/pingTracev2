@@ -10,6 +10,8 @@ import asyncio
 import csv
 import io
 import os
+import re
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 
@@ -70,6 +72,32 @@ class AnnotationCreate(BaseModel):
 class AnnotationPatch(BaseModel):
     text: str | None = None
     ts_ms: int | None = None
+
+
+class ProfileEntry(BaseModel):
+    host: str
+    port: int | None = None
+    proto: str = "tcp"
+    interval_s: float | None = None
+    label: str | None = None
+    enabled: bool = True
+    trace_enabled: bool = False
+    trace_interval_s: float | None = None
+
+
+class ProfileCreate(BaseModel):
+    name: str
+    # None = snapshot the currently active target set (the UI's "save current").
+    targets: list[ProfileEntry] | None = None
+
+
+class ProfileReplace(BaseModel):
+    targets: list[ProfileEntry]
+
+
+class ProfileImport(BaseModel):
+    name: str
+    targets: list[ProfileEntry]
 
 
 def _resolution(store: database.Store, from_ms: int, to_ms: int, bucket_ms: int) -> dict:
@@ -265,6 +293,90 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         eng._live.pop(target_id, None)
         eng.notify_config_changed()
         return {"ok": True}
+
+    # ------------------------------------------------------------- profiles
+    # GAP-7: named target sets (PingPlotter workspaces equivalent). Profiles
+    # live in the database (target_profiles / target_profile_entries); the
+    # active one is remembered in meta so a restart never re-seeds over it
+    # (main.seed_store precedence). Switching is one transaction and then
+    # notify_config_changed, so the engine re-supervises on the next tick.
+    def _profile_entries(body) -> list[dict]:
+        return [e.model_dump() for e in body.targets]
+
+    @app.get("/api/profiles")
+    def profiles_list():
+        return {"profiles": store.list_profiles(), "active_profile": store.active_profile()}
+
+    @app.post("/api/profiles", status_code=201)
+    def profile_create(body: ProfileCreate):
+        try:
+            prof = store.create_profile(body.name,
+                                        None if body.targets is None else _profile_entries(body))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail=f"profile {body.name!r} already exists")
+        return {"profile": prof}
+
+    @app.post("/api/profiles/import", status_code=201)
+    def profile_import(body: ProfileImport):
+        """Import an exported profile JSON as a new named profile. Import
+        never switches - the user chooses when to apply it."""
+        try:
+            prof = store.create_profile(body.name, _profile_entries(body))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail=f"profile {body.name!r} already exists")
+        return {"profile": prof}
+
+    @app.get("/api/profiles/{name}")
+    def profile_get(name: str):
+        prof = store.get_profile(name)
+        if prof is None:
+            raise HTTPException(status_code=404, detail="no such profile")
+        return {"profile": prof}
+
+    @app.put("/api/profiles/{name}")
+    def profile_replace(name: str, body: ProfileReplace):
+        try:
+            prof = store.replace_profile(name, _profile_entries(body))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if prof is None:
+            raise HTTPException(status_code=404, detail="no such profile")
+        return {"profile": prof}
+
+    @app.delete("/api/profiles/{name}")
+    def profile_delete(name: str):
+        if not store.delete_profile(name):
+            raise HTTPException(status_code=404, detail="no such profile")
+        return {"ok": True}
+
+    @app.get("/api/profiles/{name}/export")
+    def profile_export(name: str):
+        payload = store.export_profile(name)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="no such profile")
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "profile"
+        return JSONResponse(payload, headers={
+            "Content-Disposition": f'attachment; filename="pingtracev2-profile-{safe}.json"'})
+
+    @app.post("/api/profiles/{name}/switch")
+    def profile_switch(name: str):
+        """Swap the active target set for the profile's contents atomically,
+        then wake the supervisor so the engine reloads on the next tick.
+        A failure inside the swap rolls the whole transaction back and this
+        returns 500 with the previous set still in place - never a
+        half-applied set."""
+        try:
+            prof = store.switch_profile(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="no such profile")
+        store.add_event(None, name, "profile-switch",
+                        f"active target set replaced with {len(prof['targets'])} target(s)")
+        eng.notify_config_changed()
+        return {"ok": True, "profile": prof["name"], "targets": store.list_targets()}
 
     # ---------------------------------------------------------------- traces
     @app.post("/api/targets/{target_id}/trace")

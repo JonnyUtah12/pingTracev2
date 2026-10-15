@@ -8,6 +8,8 @@ Layout:
   traces    - on-demand route traces (hop lists as JSON), newest kept
   hop_samples - one row per hop per trace run: the per-hop time series that
                 lets the dashboard graph hop N's latency/loss over time
+  target_profiles / target_profile_entries - GAP-7 named target sets; the
+                active one is recorded in meta('active_profile')
   annotations - user-authored notes pinned to a timestamp on a target's
                 timeline (GAP-6, PingPlotter "add a comment" equivalent).
                 User data: never auto-pruned - kept until deleted, or until
@@ -29,7 +31,7 @@ from datetime import datetime, timezone
 import config
 import route_diff
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -116,7 +118,32 @@ CREATE TABLE IF NOT EXISTS annotations (
 );
 CREATE INDEX IF NOT EXISTS annotations_ix ON annotations (target_id, ts_ms DESC);
 
+CREATE TABLE IF NOT EXISTS target_profiles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS target_profile_entries (
+    profile_id       INTEGER NOT NULL REFERENCES target_profiles(id) ON DELETE CASCADE,
+    host             TEXT NOT NULL,
+    port             INTEGER NOT NULL,
+    proto            TEXT NOT NULL,
+    label            TEXT,
+    interval_s       REAL NOT NULL,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    trace_enabled    INTEGER NOT NULL DEFAULT 0,
+    trace_interval_s REAL NOT NULL DEFAULT 60,
+    UNIQUE (profile_id, host, port, proto)
+);
 """
+
+# GAP-7 note: target_profile_entries deliberately has no proto CHECK. Entries
+# are validated on write (create/replace/import); leaving the stored rows
+# CHECK-free means a corrupted entry (hand-edited db, future bug) fails at
+# switch time against the *targets* CHECK - inside the swap transaction, where
+# it rolls back cleanly - instead of making the profile itself unreadable.
 
 MAX_EVENTS_KEPT = 5000
 MAX_TRACES_KEPT_PER_TARGET = 20
@@ -313,6 +340,227 @@ class Store:
 
     def seed_targets(self, hosts, port: int, interval_s: float) -> list[dict]:
         return [self.add_target(h, port, "tcp", interval_s) for h in hosts]
+
+    # ------------------------------------------------------------- profiles
+    # GAP-7: named target sets (PingPlotter workspaces equivalent). Profiles
+    # live in the database, not in extra JSON files; the *active* one is
+    # recorded in meta('active_profile') so a restart knows the current set
+    # came from a profile and must not be re-seeded from targets.json
+    # (see main.seed_store precedence).
+    MAX_PROFILE_NAME = 64
+
+    @staticmethod
+    def _clean_profile_name(raw) -> str:
+        name = str(raw or "").strip()
+        if not name:
+            raise ValueError("profile name is empty")
+        if len(name) > Store.MAX_PROFILE_NAME:
+            raise ValueError(f"profile name is too long ({Store.MAX_PROFILE_NAME} characters max)")
+        if "/" in name or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
+            raise ValueError("profile name must not contain '/' or control characters")
+        return name
+
+    @staticmethod
+    def _normalized_profile_entries(entries) -> list[dict]:
+        """Validate + normalize profile target entries on write (same rules
+        the live API applies to targets). Duplicate (host, port, proto) rows
+        are rejected here with a clear message instead of as a bare UNIQUE
+        failure later."""
+        out: list[dict] = []
+        seen: set[tuple] = set()
+        for raw in entries:
+            host = config.normalize_host(str(raw.get("host", "")))
+            proto = str(raw.get("proto") or "tcp").lower()
+            if proto not in ("tcp", "udp", "icmp"):
+                raise ValueError(f"proto must be 'tcp', 'udp' or 'icmp' (got {raw.get('proto')!r})")
+            port_raw = raw.get("port")
+            port = 0 if proto == "icmp" else config.normalize_port(
+                port_raw if port_raw is not None else config.DEFAULT_PROBE_PORT)
+            interval = config.clamp_interval(
+                raw.get("interval_s") if raw.get("interval_s") is not None
+                else config.DEFAULT_INTERVAL_S)
+            trace_interval = float(raw.get("trace_interval_s") or 60.0)
+            trace_interval = max(5.0, min(3600.0, trace_interval))
+            key = (host, port, proto)
+            if key in seen:
+                raise ValueError(f"profile contains duplicate target {host} {proto}/{port}")
+            seen.add(key)
+            label = raw.get("label")
+            out.append({"host": host, "port": port, "proto": proto,
+                        "label": str(label).strip()[:80] if label else None,
+                        "interval_s": interval,
+                        "enabled": 1 if raw.get("enabled", True) else 0,
+                        "trace_enabled": 1 if raw.get("trace_enabled") else 0,
+                        "trace_interval_s": trace_interval})
+        if not out:
+            raise ValueError("a profile needs at least one target")
+        return out
+
+    @staticmethod
+    def _insert_profile_entries(c: sqlite3.Connection, profile_id: int, entries: list[dict]) -> None:
+        for e in entries:
+            c.execute(
+                "INSERT INTO target_profile_entries(profile_id, host, port, proto, label, "
+                "interval_s, enabled, trace_enabled, trace_interval_s) VALUES(?,?,?,?,?,?,?,?,?)",
+                (profile_id, e["host"], e["port"], e["proto"], e.get("label"),
+                 e["interval_s"], e["enabled"], e["trace_enabled"], e["trace_interval_s"]))
+
+    def create_profile(self, name: str, entries: list[dict] | None = None) -> dict:
+        """Save a named target set. entries=None snapshots the current set."""
+        name = self._clean_profile_name(name)
+        if entries is None:
+            entries = self.list_targets()
+        entries = self._normalized_profile_entries(entries)
+        with self._write_lock, self._conn() as c:
+            if c.execute("SELECT 1 FROM target_profiles WHERE name=?", (name,)).fetchone():
+                raise sqlite3.IntegrityError(f"profile {name!r} already exists")
+            ts = iso_utc()
+            c.execute("INSERT INTO target_profiles(name, created_at, updated_at) VALUES(?,?,?)",
+                      (name, ts, ts))
+            pid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            self._insert_profile_entries(c, pid, entries)
+        prof = self.get_profile(name)
+        if prof is None:  # same reasoning as add_trace: vanished row is a bug
+            raise RuntimeError(f"profile {name!r} missing right after create")
+        return prof
+
+    def list_profiles(self) -> list[dict]:
+        active = self.active_profile()
+        rows = [dict(r) for r in self._conn().execute(
+            "SELECT p.id, p.name, p.created_at, p.updated_at, "
+            "  (SELECT COUNT(*) FROM target_profile_entries e WHERE e.profile_id = p.id) AS n_entries "
+            "FROM target_profiles p ORDER BY p.name")]
+        for r in rows:
+            r["active"] = r["name"] == active
+            if r["active"]:
+                r["matches_active"] = self._profile_matches_current(r["name"])
+        return rows
+
+    def get_profile(self, name: str) -> dict | None:
+        r = self._conn().execute("SELECT * FROM target_profiles WHERE name=?", (name,)).fetchone()
+        if r is None:
+            return None
+        prof = dict(r)
+        prof["targets"] = [dict(e) for e in self._conn().execute(
+            "SELECT host, port, proto, label, interval_s, enabled, trace_enabled, trace_interval_s "
+            "FROM target_profile_entries WHERE profile_id=? ORDER BY rowid", (prof["id"],))]
+        prof["active"] = self.active_profile() == name
+        prof["matches_active"] = self._profile_matches_current(name)
+        return prof
+
+    def replace_profile(self, name: str, entries: list[dict]) -> dict | None:
+        """Update a profile's contents (name is the key; renaming = export +
+        import under a new name, deliberately not a separate operation)."""
+        name = self._clean_profile_name(name)
+        entries = self._normalized_profile_entries(entries)
+        with self._write_lock, self._conn() as c:
+            r = c.execute("SELECT id FROM target_profiles WHERE name=?", (name,)).fetchone()
+            if r is None:
+                return None
+            c.execute("DELETE FROM target_profile_entries WHERE profile_id=?", (r["id"],))
+            self._insert_profile_entries(c, r["id"], entries)
+            c.execute("UPDATE target_profiles SET updated_at=? WHERE id=?", (iso_utc(), r["id"]))
+        return self.get_profile(name)
+
+    def delete_profile(self, name: str) -> bool:
+        """Delete a profile. If it was the active one, the marker goes with
+        it: the current target set stays exactly as it is."""
+        with self._write_lock, self._conn() as c:
+            r = c.execute("SELECT id FROM target_profiles WHERE name=?", (name,)).fetchone()
+            if r is None:
+                return False
+            c.execute("DELETE FROM target_profiles WHERE id=?", (r["id"],))  # entries cascade
+            c.execute("DELETE FROM meta WHERE key='active_profile' AND value=?", (name,))
+        return True
+
+    def active_profile(self) -> str | None:
+        r = self._conn().execute("SELECT value FROM meta WHERE key='active_profile'").fetchone()
+        return r["value"] if r is not None else None
+
+    def clear_active_profile(self) -> None:
+        with self._write_lock, self._conn() as c:
+            c.execute("DELETE FROM meta WHERE key='active_profile'")
+
+    def _profile_matches_current(self, name: str) -> bool:
+        """True when the live targets table still equals the profile - the
+        UI shows 'modified' instead of lying about the active set."""
+        prof = self._conn().execute("SELECT id FROM target_profiles WHERE name=?", (name,)).fetchone()
+        if prof is None:
+            return False
+
+        def key(r):
+            return (r["host"], int(r["port"]), r["proto"], float(r["interval_s"]),
+                    int(r["enabled"]), r["label"], int(r["trace_enabled"]),
+                    float(r["trace_interval_s"]))
+
+        want = {key(r) for r in self._conn().execute(
+            "SELECT host, port, proto, interval_s, enabled, label, trace_enabled, trace_interval_s "
+            "FROM target_profile_entries WHERE profile_id=?", (prof["id"],))}
+        have = {key(r) for r in self._conn().execute(
+            "SELECT host, port, proto, interval_s, enabled, label, trace_enabled, trace_interval_s "
+            "FROM targets")}
+        return want == have
+
+    def switch_profile(self, name: str) -> dict:
+        """Atomically swap the active target set for the profile's contents.
+
+        One transaction, three steps: targets not in the profile are deleted
+        (their history cascades away, exactly like an explicit delete), new
+        ones are inserted, and targets present in both are retuned in place -
+        so switching between profiles that share a target keeps that target's
+        history instead of nuking it. If any step fails the whole transaction
+        rolls back and the previous set is untouched: there is no
+        half-applied set. On success meta('active_profile') records the
+        provenance so the next start does not re-seed over it.
+        """
+        with self._write_lock, self._conn() as c:
+            prof = c.execute("SELECT id FROM target_profiles WHERE name=?", (name,)).fetchone()
+            if prof is None:
+                raise KeyError(name)
+            entries = [dict(e) for e in c.execute(
+                "SELECT host, port, proto, label, interval_s, enabled, trace_enabled, trace_interval_s "
+                "FROM target_profile_entries WHERE profile_id=? ORDER BY rowid", (prof["id"],))]
+            current = {(r["host"], int(r["port"]), r["proto"]): dict(r) for r in
+                       c.execute("SELECT id, host, port, proto FROM targets")}
+            wanted = {(e["host"], int(e["port"]), e["proto"]): e for e in entries}
+            for key in current.keys() - wanted.keys():
+                row = current[key]
+                # mirror delete_target's explicit child cleanup so the swap
+                # is complete even if foreign_keys were ever off
+                c.execute("DELETE FROM targets WHERE id=?", (row["id"],))
+                for child in ("probes", "rollup", "traces", "hop_samples", "annotations"):
+                    c.execute(f"DELETE FROM {child} WHERE target_id=?", (row["id"],))
+            for key in wanted.keys() - current.keys():
+                e = wanted[key]
+                c.execute(
+                    "INSERT INTO targets(host, port, proto, label, interval_s, enabled, "
+                    "trace_enabled, trace_interval_s, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (e["host"], e["port"], e["proto"], e["label"], e["interval_s"],
+                     e["enabled"], e["trace_enabled"], e["trace_interval_s"], iso_utc()))
+            for key in wanted.keys() & current.keys():
+                e = wanted[key]
+                c.execute(
+                    "UPDATE targets SET label=?, interval_s=?, enabled=?, trace_enabled=?, "
+                    "trace_interval_s=? WHERE id=?",
+                    (e["label"], e["interval_s"], e["enabled"], e["trace_enabled"],
+                     e["trace_interval_s"], current[key]["id"]))
+            c.execute("INSERT INTO meta(key, value) VALUES('active_profile', ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (name,))
+        result = self.get_profile(name)
+        if result is None:
+            raise RuntimeError(f"profile {name!r} vanished during switch")
+        return result
+
+    def export_profile(self, name: str) -> dict | None:
+        """Portable JSON for a profile (the import endpoint's input shape)."""
+        prof = self.get_profile(name)
+        if prof is None:
+            return None
+        return {"version": 1, "kind": "pingtracev2-target-profile",
+                "name": prof["name"],
+                "app": {"name": config.APP_NAME, "version": config.APP_VERSION},
+                "exported_at": iso_utc(),
+                "targets": prof["targets"]}
 
     # ---------------------------------------------------------------- probes
     def record_probe(self, target_id: int, ts_ms: int, ok: bool,

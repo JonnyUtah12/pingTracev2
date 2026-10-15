@@ -170,6 +170,34 @@
     </div>
   </section>
 
+  <section class="panel profile-panel" id="profile-panel">
+    <div class="panel-head">
+      <h2 class="panel-title">target profiles
+        <span class="panel-sub">named target sets · save the current set · switch atomically · export/import JSON</span>
+      </h2>
+    </div>
+    <div class="profile-row">
+      <label class="opt" for="p-select">profile</label>
+      <select id="p-select" aria-label="saved target profiles"></select>
+      <button id="btn-profile-switch" class="btn btn-primary" type="button">Switch</button>
+      <button id="btn-profile-export" class="btn" type="button">Export JSON</button>
+      <button id="btn-profile-delete" class="btn btn-ghost" type="button">Delete</button>
+      <span id="profile-active-note" class="profile-active mono"></span>
+    </div>
+    <div class="profile-row">
+      <input id="p-name" type="text" maxlength="64" placeholder="name for the current set"
+             spellcheck="false" aria-label="new profile name">
+      <button id="btn-profile-save" class="btn" type="button">Save current set</button>
+      <label class="btn" for="p-import-file">Import JSON<input type="file" id="p-import-file"
+             accept=".json,application/json" hidden></label>
+      <span class="form-status" id="profile-status" role="status"></span>
+    </div>
+    <p class="search-note">Switching replaces the whole monitored set in one step: targets outside the
+      profile are removed with their history, targets shared with it keep their history, and the engine
+      restarts its probes immediately. The active profile is remembered across restarts — the
+      targets.json seed never overwrites it.</p>
+  </section>
+
   <div class="grid-2">
     <section class="panel">
       <div class="panel-head">

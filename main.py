@@ -16,11 +16,17 @@ C:\\ root or Program Files), in a per-user data folder instead, so elevation
 is never required.
 
 Target selection, highest priority first:
-  1. ``--targets`` on the command line (explicit beats saved state),
-  2. ``targets.json`` next to the data file (what the UI last saved),
-  3. ``config.DEFAULT_TARGETS``.
+  1. ``--targets`` on the command line (explicit beats saved state; it also
+     clears the active-profile marker, so the next start re-seeds normally),
+  2. an active named profile (GAP-7): the targets table already holds that
+     set - profiles live in the same database - so the seed is skipped
+     entirely. Re-seeding from a stale ``targets.json`` would re-add the
+     pre-switch set on top of it and clobber the switch,
+  3. ``targets.json`` next to the data file (what the UI last saved),
+  4. ``config.DEFAULT_TARGETS``.
 The effective list is written back to ``targets.json`` at startup and again on
-clean shutdown, so targets added in the dashboard survive a restart.
+clean shutdown, so targets added in the dashboard survive a restart - and
+after a profile switch the snapshot converges on the profile's set.
 """
 from __future__ import annotations
 
@@ -251,12 +257,28 @@ def save_targets(path: str, rows: list[dict]) -> bool:
 
 
 def seed_store(store: database.Store, settings: config.Settings) -> tuple[list[dict], str]:
-    """Populate the targets table. Returns (rows, source) where source is what was used."""
+    """Populate the targets table. Returns (rows, source) where source is what was used.
+
+    GAP-7 precedence, highest first (see the module docstring):
+    ``--targets`` beats everything and clears the active-profile marker; an
+    active named profile means the targets table already holds the set, so
+    the seed is skipped rather than re-adding a stale targets.json on top of
+    it; then targets.json; then the built-in defaults.
+    """
     saved = load_saved_targets(targets_file_path(settings))
+    active = store.active_profile()
     if settings.targets_explicit:
         source = "--targets"
+        store.clear_active_profile()
         for host in settings.targets:
             store.add_target(host, settings.probe_port, "tcp", settings.interval_s)
+    elif active:
+        # The DB *is* the profile's set (profiles live in this same DB).
+        # Seeding from targets.json here would re-add whatever was saved
+        # before the switch on top of it - the clobber this rule prevents.
+        source = f"profile:{active}"
+        rows = store.list_targets()
+        return rows, source
     elif saved:
         source = TARGETS_FILE_NAME
         for entry in saved:

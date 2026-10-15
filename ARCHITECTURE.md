@@ -118,6 +118,31 @@ continuous-trace loop config) and `traces.method` (which engine produced
 the row). They are deliberately not in `probes`/`rollup` - a trace is a multi-probe event
 with its own shape, not a latency sample.
 
+Schema v8 adds **target profiles** (GAP-7): `target_profiles` (unique name)
++ `target_profile_entries` (the named target set, FK-cascaded on profile
+delete), with the active profile's name in `meta('active_profile')`.
+Profiles live in this database deliberately - no extra JSON files - and are
+user data: never auto-pruned. `Store.switch_profile` swaps the live
+`targets` table for a profile's entries in ONE transaction: entries not in
+the profile are deleted (history cascades, mirroring `delete_target`'s
+explicit child cleanup), new ones inserted, and shared targets are retuned
+in place by UPDATE so their id - and therefore their probe/rollup/trace
+history - survives the switch. A corrupt entry deliberately fails against
+the *targets* CHECK inside that transaction (profile entries have no proto
+CHECK of their own) and rolls the whole swap back: never a half-applied
+set. On success the API calls `Engine.notify_config_changed` and the
+supervisor re-spawns workers on the next tick.
+
+Seed precedence at startup (`main.seed_store`, documented in `main.py`'s
+docstring and tested in `tests/test_profiles.py`): (1) `--targets` beats
+everything and clears the `active_profile` marker; (2) an active profile
+means the seed is **skipped entirely** - the targets table already holds
+that set, and re-seeding from a stale `targets.json` would re-add the
+pre-switch set on top of it and clobber the switch; (3) `targets.json`;
+(4) `config.DEFAULT_TARGETS`. The effective set is written back to
+`targets.json` at startup and shutdown regardless of source, so the
+snapshot converges on the profile's set after a switch.
+
 ## 4. Metrics — formula, window, where computed
 
 Every number the UI or the API shows, verified against the code at this
@@ -210,7 +235,9 @@ Honest notes:
 ## 5. Process model
 
 `main.py` (entry point) wires: `config.load()` → `database.Store` →
-`store.seed_targets()` → `engine.Engine` → `api.create_app()` → `uvicorn.run`.
+`seed_store()` (target-set precedence: `--targets` > active profile >
+`targets.json` > defaults, see §3) → `engine.Engine` → `api.create_app()` →
+`uvicorn.run`.
 The engine runs as asyncio tasks inside the server loop (started in the
 FastAPI lifespan), one worker per enabled target, plus one GitHub sync loop.
 No threads, no subprocess pool except the optional `ping.exe` fallback.

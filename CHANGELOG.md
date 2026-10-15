@@ -29,6 +29,23 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
   a note to the cursor time. Annotations are user data: never auto-pruned,
   removed only by deleting them or their target (README data-retention).
 
+- Target profiles (GAP-7): named target sets — the PingPlotter
+  workspace/`named_configurations` equivalent. Two tables (`target_profiles`
+  + `target_profile_entries`, schema v8) store profiles in the same database
+  as the targets themselves; no extra JSON files. API:
+  `GET/POST /api/profiles`, `GET/PUT/DELETE /api/profiles/{name}`,
+  `POST /api/profiles/{name}/switch`, `GET /api/profiles/{name}/export`
+  (downloadable JSON), `POST /api/profiles/import`. Switching swaps the whole
+  active set in ONE transaction — targets outside the profile are removed
+  with their history, shared targets are retuned in place and keep theirs,
+  and any failure rolls the swap back so there is never a half-applied set;
+  on success the engine reloads immediately (`notify_config_changed`). The
+  active profile is remembered in `meta`, and the startup seed respects it:
+  `--targets` > active profile (seed skipped — the DB already holds the set,
+  so a stale `targets.json` can never clobber a switch) > `targets.json` >
+  built-in defaults. The dashboard gets a profiles panel: save the current
+  set, switch (with confirm), delete, export/import JSON.
+
 ### Changed
 - Migration tests assert `database.SCHEMA_VERSION` instead of a hardcoded
   version string, so future schema bumps don't break older migration tests.

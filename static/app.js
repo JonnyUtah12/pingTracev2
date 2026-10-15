@@ -41,7 +41,10 @@
     'btn-search-export', 's-host', 's-error', 's-from', 's-to', 's-only-fail',
     'search-quick', 'search-results', 'search-rows', 'search-note', 'search-status',
     'btn-add-note', 'note-modal', 'note-ts', 'note-form', 'note-target',
-    'note-text', 'note-error', 'note-cancel', 'note-save'
+    'note-text', 'note-error', 'note-cancel', 'note-save',
+    'profile-panel', 'p-select', 'btn-profile-switch', 'btn-profile-export',
+    'btn-profile-delete', 'profile-active-note', 'p-name', 'btn-profile-save',
+    'p-import-file', 'profile-status'
   ];
   const el = {};
   for (const id of IDS) el[id] = document.getElementById(id);
@@ -200,7 +203,8 @@
     { key: 'events', interval: 5000, path: () => '/api/events?limit=50', run: onEvents },
     { key: 'health', interval: 10000, path: () => '/api/health', run: onHealth },
     { key: 'config', interval: 10000, path: () => '/api/config', run: onConfig },
-    { key: 'stats', interval: 30000, path: () => '/api/stats', run: onStats }
+    { key: 'stats', interval: 30000, path: () => '/api/stats', run: onStats },
+    { key: 'profiles', interval: 10000, path: () => '/api/profiles', run: onProfiles }
   ];
   for (const j of JOBS) { j.due = 0; j.fails = 0; j.busy = false; }
 
@@ -1009,6 +1013,137 @@
     }
   });
 
+  /* --------------------------- target profiles (GAP-7) ------------------- */
+  /* Named target sets. The panel is deliberately small: save the current
+     set, pick one and switch, export/import the JSON. A switch replaces
+     the whole set server-side in one transaction and wakes the engine;
+     the UI just kicks its own jobs and lets the live/history payloads
+     rebuild the cards. */
+  let profileList = [];
+
+  function onProfiles(data) {
+    profileList = (data && data.profiles) || [];
+    renderProfilePanel(data && data.active_profile);
+  }
+
+  function renderProfilePanel(active) {
+    const sel = el['p-select'];
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = profileList.map((p) => {
+      let label = p.name + ' · ' + p.n_entries + ' target' + (p.n_entries === 1 ? '' : 's');
+      if (p.active) label += p.matches_active === false ? ' (active, modified)' : ' (active)';
+      return '<option value="' + esc(p.name) + '">' + esc(label) + '</option>';
+    }).join('');
+    if (profileList.some((p) => p.name === prev)) sel.value = prev;
+    if (el['profile-active-note']) {
+      el['profile-active-note'].textContent = active ? 'active: ' + active : 'no active profile';
+    }
+    const none = profileList.length === 0;
+    for (const id of ['btn-profile-switch', 'btn-profile-export', 'btn-profile-delete']) {
+      if (el[id]) el[id].disabled = none;
+    }
+  }
+
+  function selectedProfile() {
+    const sel = el['p-select'];
+    return sel && sel.value ? sel.value : null;
+  }
+
+  async function switchProfile() {
+    const name = selectedProfile();
+    if (!name) { setFormStatus('profile-status', 'pick a profile first', 'err'); return; }
+    const ok = await openModal({
+      title: 'Switch to profile',
+      body: 'Replace the whole monitored set with "' + name + '"? Targets outside it are ' +
+            'removed with their history; shared targets keep theirs. This cannot be undone.',
+      okLabel: 'Switch now'
+    });
+    if (!ok) return;
+    try {
+      const data = await api('/api/profiles/' + encodeURIComponent(name) + '/switch',
+                             { method: 'POST' });
+      setFormStatus('profile-status', 'switched to "' + name + '" — ' +
+                    data.targets.length + ' target(s), engine reloaded', 'ok');
+      kick('live'); kick('history'); kick('events'); kick('profiles');
+    } catch (err) {
+      setFormStatus('profile-status', 'switch failed: ' + err.message, 'err');
+    }
+  }
+
+  async function saveProfile() {
+    const name = (el['p-name'].value || '').trim();
+    if (!name) { setFormStatus('profile-status', 'give the profile a name first', 'err'); return; }
+    try {
+      await api('/api/profiles', { method: 'POST', body: { name: name } });
+      el['p-name'].value = '';
+      setFormStatus('profile-status', 'saved current set as "' + name + '"', 'ok');
+      kick('profiles');
+    } catch (err) {
+      setFormStatus('profile-status', 'save failed: ' + err.message, 'err');
+    }
+  }
+
+  async function deleteProfile() {
+    const name = selectedProfile();
+    if (!name) return;
+    const ok = await openModal({
+      title: 'Delete profile',
+      body: 'Forget the saved set "' + name + '"? The currently monitored targets are left ' +
+            'exactly as they are.',
+      okLabel: 'Delete profile'
+    });
+    if (!ok) return;
+    try {
+      await api('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+      setFormStatus('profile-status', 'deleted profile "' + name + '"', 'ok');
+      kick('profiles');
+    } catch (err) {
+      setFormStatus('profile-status', 'delete failed: ' + err.message, 'err');
+    }
+  }
+
+  async function exportProfile() {
+    const name = selectedProfile();
+    if (!name) return;
+    setFormStatus('profile-status', 'exporting…', 'ok');
+    try {
+      const res = await fetch('/api/profiles/' + encodeURIComponent(name) + '/export',
+        { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+      if (!res.ok) {
+        let detail = 'HTTP ' + res.status;
+        try { detail = (await res.json()).detail || detail; } catch (e) { /* not JSON */ }
+        throw new Error(detail);
+      }
+      const blob = await res.blob();
+      const m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
+      const filename = m ? m[1] : 'pingtracev2-profile.json';
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href; a.download = filename; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 30000);
+      setFormStatus('profile-status', 'wrote ' + filename, 'ok');
+    } catch (err) {
+      setFormStatus('profile-status', 'export failed: ' + err.message, 'err');
+    }
+  }
+
+  async function importProfile(file) {
+    try {
+      const data = JSON.parse(await file.text());
+      if (!data || !data.name || !Array.isArray(data.targets)) {
+        throw new Error('not a profile export (needs name + targets)');
+      }
+      await api('/api/profiles/import',
+                { method: 'POST', body: { name: String(data.name), targets: data.targets } });
+      setFormStatus('profile-status', 'imported "' + data.name + '" — pick it and Switch to apply', 'ok');
+      kick('profiles');
+    } catch (err) {
+      setFormStatus('profile-status', 'import failed: ' + err.message, 'err');
+    }
+  }
+
   /* ------------------------------ route tracing -------------------------- */
   /* Continuous tracing: the engine loop writes a new trace row per round;
      the card just reads the newest one, throttled, and re-renders on change. */
@@ -1288,6 +1423,15 @@
   /* ------------------------------ poll handlers -------------------------- */
   function onLive(data) {
     const list = (data && data.targets) || [];
+    // Targets can disappear server-side (a profile switch deletes the
+    // previous set). /api/live always carries every row in the targets
+    // table, so prune the cache to the payload's ids - syncTargetSet's
+    // existing guards then remove the stale cards. Before this, only the
+    // UI delete handler pruned, and a switched-away target left a ghost.
+    const liveIds = new Set(list.map((t) => t.id));
+    for (const id of Array.from(state.targets.keys())) {
+      if (!liveIds.has(id)) state.targets.delete(id);
+    }
     let total = 0, failed = 0, down = 0;
     for (const t of list) {
       state.targets.set(t.id, Object.assign({}, state.targets.get(t.id), t));
@@ -1864,6 +2008,15 @@
   });
   if (el['btn-search-export']) el['btn-search-export'].addEventListener('click', () => downloadCsv('search-status'));
   if (el['btn-export']) el['btn-export'].addEventListener('click', () => downloadCsv('export-status'));
+  if (el['btn-profile-switch']) el['btn-profile-switch'].addEventListener('click', switchProfile);
+  if (el['btn-profile-save']) el['btn-profile-save'].addEventListener('click', saveProfile);
+  if (el['btn-profile-delete']) el['btn-profile-delete'].addEventListener('click', deleteProfile);
+  if (el['btn-profile-export']) el['btn-profile-export'].addEventListener('click', exportProfile);
+  if (el['p-import-file']) el['p-import-file'].addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) importProfile(f);
+    e.target.value = '';  // let the same file be picked again after a fix
+  });
   if (el['search-quick']) el['search-quick'].addEventListener('click', (e) => {
     const btn = e.target.closest('[data-span]');
     if (!btn) return;
