@@ -7,7 +7,16 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-15
+
+First release of the pingTracev2 line (rebranded from pingTrace v1.3.2,
+full history preserved). Goal: a portable, no-admin PingPlotter-style
+monitor.
+
 ### Added
+- Route-change detection (GAP-4 slice 1): every stored trace run is
+  compared with the previous one per hop index; responder-address changes
+  are recorded as route changes and surfaced in the trace history.
 - Per-hop time series (GAP-1 slice 1): every stored trace run now records one
   `hop_samples` row per hop (responder address, mean answered-probe RTT or
   NULL when the hop was silent, probe/answered counts). Schema v5; existing
@@ -17,8 +26,13 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
   `/api/history` (timeouts are never 0 ms; empty buckets are gaps), plus the
   responder addresses seen at each hop index in the window so the dashboard
   can label rows and flag route changes.
-- `hop_samples` rows are pruned by the same retention floor as rollups and
-  removed with their target; the stats block reports the row count.
+- Dashboard per-hop graph rows (GAP-1 slice 2): each target card renders
+  one latency/loss graph per hop fed by hop-history - the PingPlotter
+  signature view.
+- Per-bucket jitter stored in rollups and served from `/api/history`
+  (GAP-2); long-range jitter no longer needs raw rows.
+- Opt-in GitHub issue alerts on route changes (GAP-4 slice 2): aggregate
+  summary only, never one issue per hop.
 - Timeline annotations (GAP-6): an `annotations` table (schema v7) pins a
   short note (1-500 chars, bound enforced in the schema CHECK) to a timestamp
   on one target's timeline. CRUD API: `POST/GET /api/targets/{id}/annotations`
@@ -28,20 +42,19 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
   The dashboard gets an "add note" button and a double-click gesture that pin
   a note to the cursor time. Annotations are user data: never auto-pruned,
   removed only by deleting them or their target (README data-retention).
-
-- Target profiles (GAP-7): named target sets — the PingPlotter
+- Target profiles (GAP-7): named target sets - the PingPlotter
   workspace/`named_configurations` equivalent. Two tables (`target_profiles`
   + `target_profile_entries`, schema v8) store profiles in the same database
   as the targets themselves; no extra JSON files. API:
   `GET/POST /api/profiles`, `GET/PUT/DELETE /api/profiles/{name}`,
   `POST /api/profiles/{name}/switch`, `GET /api/profiles/{name}/export`
   (downloadable JSON), `POST /api/profiles/import`. Switching swaps the whole
-  active set in ONE transaction — targets outside the profile are removed
+  active set in ONE transaction - targets outside the profile are removed
   with their history, shared targets are retuned in place and keep theirs,
   and any failure rolls the swap back so there is never a half-applied set;
   on success the engine reloads immediately (`notify_config_changed`). The
   active profile is remembered in `meta`, and the startup seed respects it:
-  `--targets` > active profile (seed skipped — the DB already holds the set,
+  `--targets` > active profile (seed skipped - the DB already holds the set,
   so a stale `targets.json` can never clobber a switch) > `targets.json` >
   built-in defaults. The dashboard gets a profiles panel: save the current
   set, switch (with confirm), delete, export/import JSON.
@@ -49,3 +62,5 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
 ### Changed
 - Migration tests assert `database.SCHEMA_VERSION` instead of a hardcoded
   version string, so future schema bumps don't break older migration tests.
+- Docs: ARCHITECTURE metric formulas/windows (GAP-3) and README Smart App
+  Control guidance (GAP-5).
