@@ -112,6 +112,8 @@
       <h2 class="panel-title">latency trace <span class="panel-sub">ms · per target · gaps = no data · <span id="resolution-readout">resolution unknown</span> · <span id="last-data">no data yet</span></span></h2>
       <p class="data-stale" id="data-stale" hidden></p>
       <div id="chart-legend" class="legend" aria-label="series legend"></div>
+      <button id="btn-add-note" class="btn btn-sm" type="button"
+              title="pin a note to the graph at the cursor time (n)">add note</button>
     </div>
     <div class="chart-wrap">
       <canvas id="latency-chart" aria-label="latency over time" role="img"></canvas>
@@ -237,6 +239,27 @@
       <button id="modal-cancel" class="btn btn-ghost" type="button">Cancel</button>
       <button id="modal-ok" class="btn btn-danger" type="button">Confirm</button>
     </div>
+  </div>
+</div>
+
+<div id="note-modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="note-modal-title">
+    <h3 id="note-modal-title">Add note at <span id="note-ts" class="mono"></span></h3>
+    <form id="note-form" novalidate autocomplete="off">
+      <div class="field">
+        <label for="note-target">target</label>
+        <select id="note-target"></select>
+      </div>
+      <div class="field">
+        <label for="note-text">note <span class="opt">max 500 characters</span></label>
+        <textarea id="note-text" rows="3" maxlength="500" placeholder="what happened at this time?"></textarea>
+        <p class="field-error" id="note-error" hidden></p>
+      </div>
+      <div class="modal-actions">
+        <button id="note-cancel" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="note-save" class="btn btn-primary" type="submit">Save note</button>
+      </div>
+    </form>
   </div>
 </div>
 

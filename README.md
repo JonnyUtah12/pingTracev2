@@ -144,6 +144,24 @@ folder is carried over automatically, and the startup window says where state
 now lives. Move the folder somewhere writable to go back to fully portable
 state. `github.json` is always read from the app folder.
 
+## Data retention
+
+Probe data ages out on a fixed schedule so a year of 1-second probing stays
+a few MB:
+
+- raw per-probe rows are kept for `RAW_WINDOW_HOURS`, then rolled up into
+  60-second aggregates and deleted;
+- rollup rows (and the per-hop `hop_samples` rows behind the per-hop graphs)
+  are dropped past the retention window shown in the footer;
+- route traces keep only the newest 20 per target, and the event log the
+  newest 5000 rows.
+
+**Annotations are different: they are your data, not probe data.** Notes you
+pin to the timeline (`add note` on the graph, or the `/api/.../annotations`
+API) are never auto-pruned - they survive every retention pass and every
+restart. A note is removed only when you delete it, or when you delete the
+target it belongs to.
+
 ## Building the portable folder from source
 
 Only needed if you want to build the exe yourself - the release zip already

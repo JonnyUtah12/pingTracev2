@@ -39,7 +39,9 @@
     'data-stale', 'targets-down', 'db-rows',
     'search-panel', 'search-form', 'btn-search-close', 'btn-search-go', 'btn-search-clear',
     'btn-search-export', 's-host', 's-error', 's-from', 's-to', 's-only-fail',
-    'search-quick', 'search-results', 'search-rows', 'search-note', 'search-status'
+    'search-quick', 'search-results', 'search-rows', 'search-note', 'search-status',
+    'btn-add-note', 'note-modal', 'note-ts', 'note-form', 'note-target',
+    'note-text', 'note-error', 'note-cancel', 'note-save'
   ];
   const el = {};
   for (const id of IDS) el[id] = document.getElementById(id);
@@ -143,7 +145,10 @@
     modalPrevFocus: null,
     searchOpen: false,
     searchWindow: null,
-    lastResolution: null
+    lastResolution: null,
+    annotations: new Map(),     // GAP-6: id -> [{id, ts, text}] from the history payload
+    cursorTs: null,             // last pointer position on the chart, in epoch-ms
+    noteTs: null                // timestamp the open note modal is pinned to
   };
 
   /* ------------------------------ fetch layer ---------------------------- */
@@ -472,6 +477,43 @@
     updateReadouts();
   }
 
+  /* GAP-6: annotation markers. A draw-only Chart.js plugin: it paints a
+     dashed vertical line plus a flag dot at each note's timestamp, in the
+     target's palette colour, and never touches the dataset code paths. */
+  const annotationMarkerPlugin = {
+    id: 'ptAnnotations',
+    afterDatasetsDraw(c) {
+      const xs = c.scales.x;
+      const area = c.chartArea;
+      if (!xs || !area) return;
+      const ctx = c.ctx;
+      state.order.forEach((id, idx) => {
+        if (state.hiddenSeries.has(id)) return;
+        const annos = state.annotations.get(id);
+        if (!annos || !annos.length) return;
+        const color = colorFor(idx);
+        for (const a of annos) {
+          if (a.ts < xs.min || a.ts > xs.max) continue;
+          const x = xs.getPixelForValue(a.ts);
+          ctx.save();
+          ctx.strokeStyle = withAlpha(color, 0.75);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(x, area.top);
+          ctx.lineTo(x, area.bottom);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(x, area.top + 5, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+      });
+    }
+  };
+
   function createChart() {
     if (!window.Chart) {
       setConnected(false, 'chart library failed to load');
@@ -484,6 +526,7 @@
     chart = new window.Chart(ctx, {
       type: 'line',
       data: { datasets: [] },
+      plugins: [annotationMarkerPlugin],
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -522,6 +565,17 @@
                   const p = lookupAt(s, ts);
                   lines.push('  ' + pad(targetName(t), 22) + ' avg ' + pad(fmtMs(p ? p.avg : null), 9) +
                     ' max ' + pad(fmtMs(p ? p.max : null), 9) + ' loss ' + fmtPct(p ? p.loss : null));
+                });
+                // GAP-6: notes near the hovered time read out right in the tooltip.
+                state.order.forEach((id) => {
+                  const t = state.targets.get(id);
+                  const list = state.annotations.get(id);
+                  if (!t || !list) return;
+                  for (const a of list) {
+                    if (Math.abs(a.ts - ts) <= Math.max(state.bucketMs || 0, 1000) * 2) {
+                      lines.push('  note ' + targetName(t) + ': ' + a.text);
+                    }
+                  }
                 });
                 return lines;
               }
@@ -604,6 +658,14 @@
       try { canvas.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     });
     canvas.addEventListener('pointermove', (e) => {
+      if (chart && !dragging) {
+        // GAP-6: remember where the cursor is on the time axis so "add note"
+        // can pin a note to exactly that moment.
+        const a0 = chart.chartArea;
+        if (a0 && e.offsetX >= a0.left && e.offsetX <= a0.right) {
+          state.cursorTs = Math.round(chart.scales.x.getValueForPixel(e.offsetX));
+        }
+      }
       if (!dragging || !chart) return;
       const dx = e.clientX - lastX; lastX = e.clientX;
       if (!dx) return;
@@ -633,6 +695,14 @@
       state.view = { from: from, to: to };
       syncChart(true);
     }, { passive: false });
+
+    // GAP-6: double-click is the direct "note at this time" gesture.
+    canvas.addEventListener('dblclick', (e) => {
+      if (!chart) return;
+      const area = chart.chartArea;
+      if (!area || e.offsetX < area.left || e.offsetX > area.right) return;
+      openNoteModal(Math.round(chart.scales.x.getValueForPixel(e.offsetX)));
+    });
   }
 
   function shiftWindow(deltaMs) {
@@ -1250,6 +1320,11 @@
         if (!isFinite(ts)) continue;
         ingestPoint(s, ts, { avg: p[1], max: p[2], loss: p[3] });
       }
+      // GAP-6: the series payload carries this window's notes; the marker
+      // plugin draws them, so replace the window's set wholesale each poll.
+      state.annotations.set(t.id, (t.annotations || []).map((a) => ({
+        id: Number(a.id), ts: Number(a.ts_ms), text: String(a.text || '')
+      })).filter((a) => isFinite(a.ts)));
     }
     syncChart(false);
   }
@@ -1462,6 +1537,80 @@
   if (el['modal-ok']) el['modal-ok'].addEventListener('click', () => closeModal(true));
   if (el['modal-cancel']) el['modal-cancel'].addEventListener('click', () => closeModal(false));
   if (el['modal']) el['modal'].addEventListener('click', (e) => { if (e.target === el['modal']) closeModal(false); });
+
+  /* ------------------------- note modal (GAP-6) -------------------------- */
+  /* "Add note at cursor time": the button uses the last chart cursor (or the
+     middle of the visible window if the pointer never entered the plot), a
+     double-click on the chart uses the clicked instant. The note is pinned to
+     that exact epoch-ms; markers come back with the next history poll. */
+  function noteTargets() {
+    return state.order.filter((id) => state.targets.has(id));
+  }
+  function openNoteModal(ts) {
+    const modal = el['note-modal'];
+    if (!modal) return;
+    const targets = noteTargets();
+    if (!targets.length) {
+      setConnected(false, 'add a target before annotating the graph');
+      return;
+    }
+    state.noteTs = ts;
+    if (el['note-ts']) el['note-ts'].textContent = hhmmss(ts);
+    if (el['note-target']) {
+      el['note-target'].innerHTML = targets.map((id) => {
+        const t = state.targets.get(id);
+        return '<option value="' + id + '">' + esc(targetName(t)) + '</option>';
+      }).join('');
+      const firstVisible = targets.find((id) => !state.hiddenSeries.has(id));
+      el['note-target'].value = String(firstVisible || targets[0]);
+    }
+    if (el['note-text']) el['note-text'].value = '';
+    if (el['note-error']) { el['note-error'].textContent = ''; el['note-error'].hidden = true; }
+    modal.hidden = false;
+    modal.classList.add('is-open');
+    if (el['note-text']) el['note-text'].focus();
+  }
+  function closeNoteModal() {
+    const modal = el['note-modal'];
+    if (!modal || modal.hidden) return;
+    modal.hidden = true;
+    modal.classList.remove('is-open');
+    state.noteTs = null;
+  }
+  function noteError(message) {
+    const n = el['note-error'];
+    if (!n) return;
+    n.textContent = message || '';
+    n.hidden = !message;
+  }
+  if (el['btn-add-note']) el['btn-add-note'].addEventListener('click', () => {
+    const w = windowBounds();
+    openNoteModal(state.cursorTs || Math.round((w.from + w.to) / 2));
+  });
+  if (el['note-cancel']) el['note-cancel'].addEventListener('click', closeNoteModal);
+  if (el['note-modal']) el['note-modal'].addEventListener('click', (e) => {
+    if (e.target === el['note-modal']) closeNoteModal();
+  });
+  if (el['note-form']) el['note-form'].addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const tid = Number(el['note-target'] && el['note-target'].value);
+    const text = (el['note-text'] && el['note-text'].value || '').trim();
+    if (!tid || !state.noteTs) { noteError('pick a target first'); return; }
+    if (!text) { noteError('the note text cannot be empty'); return; }
+    if (text.length > 500) { noteError('notes are limited to 500 characters'); return; }
+    const btn = el['note-save'];
+    if (btn) btn.disabled = true;
+    try {
+      await api('/api/targets/' + tid + '/annotations',
+        { method: 'POST', body: { text: text, ts_ms: state.noteTs } });
+      closeNoteModal();
+      kick('history');
+    } catch (err) {
+      noteError(err.message || 'could not save the note');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
 
   /* ------------------------------ search + export ------------------------ */
   const SEARCH_MAX_MS = 7 * 86400000;
@@ -1733,6 +1882,7 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (el['modal'] && !el['modal'].hidden) { e.preventDefault(); closeModal(false); return; }
+      if (el['note-modal'] && !el['note-modal'].hidden) { e.preventDefault(); closeNoteModal(); return; }
       if (state.searchOpen) { e.preventDefault(); clearSearch(); }
       return;
     }
@@ -1740,9 +1890,11 @@
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
     if (el['modal'] && !el['modal'].hidden) return;
+    if (el['note-modal'] && !el['note-modal'].hidden) return;
     const k = e.key.toLowerCase();
     if (k === 'p') { e.preventDefault(); setPaused(!state.paused); }
     else if (k === 'a') { e.preventDefault(); el['f-host'].focus(); el['f-host'].select(); }
+    else if (k === 'n') { e.preventDefault(); openNoteModal(state.cursorTs || Math.round((windowBounds().from + windowBounds().to) / 2)); }
   });
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) for (const j of JOBS) j.due = 0; });

@@ -369,7 +369,7 @@ main { padding: 14px 16px 24px; max-width: 1500px; margin: 0 auto; }
 .field-wide { grid-column: 1 / -1; }
 .field label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); }
 .field .opt { color: var(--text-faint); text-transform: none; letter-spacing: 0; }
-.field input, .field select {
+.field input, .field select, .field textarea {
   font: inherit; font-size: 12px;
   padding: 7px 9px;
   border: 1px solid var(--border-strong);
@@ -379,9 +379,13 @@ main { padding: 14px 16px 24px; max-width: 1500px; margin: 0 auto; }
   min-width: 0;
 }
 .field input.mono, #f-host, #f-port { font-family: var(--mono); }
-.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+.field input:focus, .field select:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
 .field input.is-invalid { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--panel-2)); }
 .field-error { font-size: 11px; color: var(--bad); min-height: 0; }
+
+/* note modal (GAP-6): same field styling, stacked vertically */
+#note-form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+#note-text { resize: vertical; min-height: 56px; }
 .form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; }
 .form-status { font-size: 11px; color: var(--text-faint); }
 .form-status-ok { color: var(--ok); }

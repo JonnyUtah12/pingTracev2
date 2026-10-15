@@ -19,6 +19,15 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
   can label rows and flag route changes.
 - `hop_samples` rows are pruned by the same retention floor as rollups and
   removed with their target; the stats block reports the row count.
+- Timeline annotations (GAP-6): an `annotations` table (schema v7) pins a
+  short note (1-500 chars, bound enforced in the schema CHECK) to a timestamp
+  on one target's timeline. CRUD API: `POST/GET /api/targets/{id}/annotations`
+  and `PATCH/DELETE /api/annotations/{id}`; the `/api/history` payloads carry
+  the window's notes so the chart draws a marker at each annotated moment
+  (dashed line + flag dot in the target's colour, note text in the tooltip).
+  The dashboard gets an "add note" button and a double-click gesture that pin
+  a note to the cursor time. Annotations are user data: never auto-pruned,
+  removed only by deleting them or their target (README data-retention).
 
 ### Changed
 - Migration tests assert `database.SCHEMA_VERSION` instead of a hardcoded

@@ -8,6 +8,10 @@ Layout:
   traces    - on-demand route traces (hop lists as JSON), newest kept
   hop_samples - one row per hop per trace run: the per-hop time series that
                 lets the dashboard graph hop N's latency/loss over time
+  annotations - user-authored notes pinned to a timestamp on a target's
+                timeline (GAP-6, PingPlotter "add a comment" equivalent).
+                User data: never auto-pruned - kept until deleted, or until
+                the target they belong to is deleted.
 
 Raw rows are rolled up and deleted so a 1s probe interval over 7 days stays a
 few MB instead of hundreds of MB. Recent data (what the live graph shows) is
@@ -25,7 +29,7 @@ from datetime import datetime, timezone
 import config
 import route_diff
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -102,10 +106,23 @@ CREATE TABLE IF NOT EXISTS hop_samples (
     answered  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS hop_samples_ix ON hop_samples (target_id, hop_index, ts_ms DESC);
+
+CREATE TABLE IF NOT EXISTS annotations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id  INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    ts_ms      INTEGER NOT NULL,
+    text       TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 500),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS annotations_ix ON annotations (target_id, ts_ms DESC);
+
 """
 
 MAX_EVENTS_KEPT = 5000
 MAX_TRACES_KEPT_PER_TARGET = 20
+# GAP-6: an annotation is a short human note, not a document. The bound is
+# enforced in the schema CHECK too, so a hand-edited db can't grow past it.
+MAX_ANNOTATION_TEXT = 500
 
 
 def now_ms() -> int:
@@ -291,6 +308,7 @@ class Store:
             c.execute("DELETE FROM rollup WHERE target_id=?", (target_id,))
             c.execute("DELETE FROM traces WHERE target_id=?", (target_id,))
             c.execute("DELETE FROM hop_samples WHERE target_id=?", (target_id,))
+            c.execute("DELETE FROM annotations WHERE target_id=?", (target_id,))
         return cur.rowcount > 0
 
     def seed_targets(self, hosts, port: int, interval_s: float) -> list[dict]:
@@ -610,9 +628,108 @@ class Store:
             out.append(hop)
         return out
 
+    # ---------------------------------------------------------- annotations
+    # GAP-6: timeline annotations (PingPlotter "add a comment" equivalent).
+    # RETENTION POLICY: annotations are user data. Unlike probes/rollup/
+    # hop_samples they are NEVER auto-pruned - prune() deliberately never
+    # touches this table, and rows live until the user deletes them or the
+    # target they belong to is deleted (FK + delete_target cleanup).
+    def add_annotation(self, target_id: int, ts_ms: int, text: str) -> dict:
+        """Insert one note. Raises ValueError for empty/over-long text so the
+        API can answer 400 instead of tripping the schema CHECK."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("annotation text must not be empty")
+        if len(text) > MAX_ANNOTATION_TEXT:
+            raise ValueError(f"annotation text is limited to {MAX_ANNOTATION_TEXT} characters")
+        ts_ms = int(ts_ms)
+        if ts_ms <= 0:
+            raise ValueError("ts_ms must be a positive epoch-ms timestamp")
+        with self._write_lock, self._conn() as c:
+            c.execute("INSERT INTO annotations(target_id, ts_ms, text, created_at) "
+                      "VALUES(?,?,?,?)", (int(target_id), ts_ms, text, iso_utc()))
+            r = c.execute("SELECT * FROM annotations WHERE id=?",
+                          (c.execute("SELECT last_insert_rowid()").fetchone()[0],)).fetchone()
+        return dict(r)
+
+    def get_annotation(self, annotation_id: int) -> dict | None:
+        return self._row(self._conn().execute("SELECT * FROM annotations WHERE id=?",
+                                              (int(annotation_id),)).fetchone())
+
+    def list_annotations(self, target_id: int, from_ms: int | None = None,
+                        to_ms: int | None = None, limit: int = 500) -> list[dict]:
+        """Notes for one target, chronological (chart draw order)."""
+        limit = max(1, min(int(limit), 1000))
+        sql = "SELECT * FROM annotations WHERE target_id=?"
+        args: list = [int(target_id)]
+        if from_ms is not None:
+            sql += " AND ts_ms >= ?"
+            args.append(int(from_ms))
+        if to_ms is not None:
+            sql += " AND ts_ms < ?"
+            args.append(int(to_ms))
+        sql += " ORDER BY ts_ms, id LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self._conn().execute(sql, args)]
+
+    def annotations_in(self, target_ids, from_ms: int, to_ms: int,
+                       limit_per_target: int = 200) -> dict[int, list[dict]]:
+        """Marker payloads for the history endpoints: {target_id: [{id, ts_ms,
+        text}, ...]} inside the window, chronological, bounded per target so a
+        series payload can never be flooded by notes."""
+        ids = [int(i) for i in target_ids]
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        out: dict[int, list[dict]] = {i: [] for i in ids}
+        rows = self._conn().execute(
+            f"SELECT id, target_id, ts_ms, text FROM annotations "
+            f"WHERE target_id IN ({marks}) AND ts_ms >= ? AND ts_ms < ? "
+            f"ORDER BY target_id, ts_ms, id", ids + [int(from_ms), int(to_ms)])
+        for r in rows:
+            bucket = out.setdefault(int(r["target_id"]), [])
+            if len(bucket) < limit_per_target:
+                bucket.append({"id": int(r["id"]), "ts_ms": int(r["ts_ms"]), "text": r["text"]})
+        return out
+
+    def update_annotation(self, annotation_id: int, text: str | None = None,
+                          ts_ms: int | None = None) -> dict | None:
+        """Edit a note's text and/or timestamp in place; None fields unchanged."""
+        sets, vals = [], []
+        if text is not None:
+            text = text.strip()
+            if not text:
+                raise ValueError("annotation text must not be empty")
+            if len(text) > MAX_ANNOTATION_TEXT:
+                raise ValueError(f"annotation text is limited to {MAX_ANNOTATION_TEXT} characters")
+            sets.append("text=?")
+            vals.append(text)
+        if ts_ms is not None:
+            ts_ms = int(ts_ms)
+            if ts_ms <= 0:
+                raise ValueError("ts_ms must be a positive epoch-ms timestamp")
+            sets.append("ts_ms=?")
+            vals.append(ts_ms)
+        if not sets:
+            return self.get_annotation(annotation_id)
+        vals.append(int(annotation_id))
+        with self._write_lock, self._conn() as c:
+            c.execute(f"UPDATE annotations SET {', '.join(sets)} WHERE id=?", vals)
+        return self.get_annotation(annotation_id)
+
+    def delete_annotation(self, annotation_id: int) -> bool:
+        with self._write_lock, self._conn() as c:
+            cur = c.execute("DELETE FROM annotations WHERE id=?", (int(annotation_id),))
+        return cur.rowcount > 0
+
     # ------------------------------------------------------------- retention
     def prune(self, now: int | None = None) -> dict:
-        """Roll up stale raw rows into 60s buckets, then drop them and old rollups."""
+        """Roll up stale raw rows into 60s buckets, then drop them and old rollups.
+
+        Never touches `annotations`: those are user-authored notes, not probe
+        data, and are kept until explicitly deleted (see the annotations
+        section above and the README data-retention section).
+        """
         now = now or now_ms()
         cutoff = now - self.raw_window_ms
         floor = now - self.retention_ms

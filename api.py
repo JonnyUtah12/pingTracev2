@@ -62,6 +62,16 @@ class TargetPatch(BaseModel):
     alert_route_changes: bool | None = None
 
 
+class AnnotationCreate(BaseModel):
+    text: str
+    ts_ms: int | None = None  # None = "now" (the UI sends the cursor time)
+
+
+class AnnotationPatch(BaseModel):
+    text: str | None = None
+    ts_ms: int | None = None
+
+
 def _resolution(store: database.Store, from_ms: int, to_ms: int, bucket_ms: int) -> dict:
     """Say honestly where the points in this window actually come from.
 
@@ -307,6 +317,50 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         return {"range": range, "bucket_ms": bucket_ms, "from_ms": from_ms, "to_ms": to_ms,
                 "hops": store.hop_history(target_id, from_ms, to_ms, bucket_ms)}
 
+    # ---------------------------------------------------------- annotations
+    # GAP-6: timeline notes (PingPlotter "add a comment" equivalent). The
+    # text bound (1..500 chars) lives in database.MAX_ANNOTATION_TEXT and the
+    # schema CHECK; the API turns a violation into a clean 400.
+    @app.post("/api/targets/{target_id}/annotations", status_code=201)
+    def add_annotation(target_id: int, body: AnnotationCreate):
+        if store.get_target(target_id) is None:
+            raise HTTPException(status_code=404, detail="no such target")
+        try:
+            row = store.add_annotation(target_id, body.ts_ms if body.ts_ms is not None
+                                       else database.now_ms(), body.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"annotation": row}
+
+    @app.get("/api/targets/{target_id}/annotations")
+    def annotations_list(target_id: int, range: str = "24h",
+                         from_ms: int = 0, to_ms: int = 0):
+        """Notes for one target, chronological. `range` is a rolling window;
+        from_ms/to_ms (both, valid) override it with an absolute window."""
+        if range not in RANGES:
+            raise HTTPException(status_code=400, detail=f"range must be one of {', '.join(RANGES)}")
+        to = database.now_ms()
+        frm = to - RANGES[range]
+        if from_ms > 0 and to_ms > from_ms:
+            frm, to = int(from_ms), int(to_ms)
+        return {"annotations": store.list_annotations(target_id, frm, to)}
+
+    @app.patch("/api/annotations/{annotation_id}")
+    def patch_annotation(annotation_id: int, body: AnnotationPatch):
+        if store.get_annotation(annotation_id) is None:
+            raise HTTPException(status_code=404, detail="no such annotation")
+        try:
+            row = store.update_annotation(annotation_id, text=body.text, ts_ms=body.ts_ms)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"annotation": row}
+
+    @app.delete("/api/annotations/{annotation_id}")
+    def delete_annotation(annotation_id: int):
+        if not store.delete_annotation(annotation_id):
+            raise HTTPException(status_code=404, detail="no such annotation")
+        return {"ok": True}
+
     # ----------------------------------------------------------- live/history
     @app.get("/api/live")
     def live():
@@ -324,11 +378,15 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         from_ms = to_ms - RANGES[range]
         bucket_ms = _resolve_bucket(bucket, to_ms - from_ms, min(i["interval_s"] for i in targets))
         series = store.history([t["id"] for t in targets], from_ms, to_ms, bucket_ms)
+        # GAP-6: notes ride along with the series so the chart can draw their
+        # markers without a second request per target.
+        annos = store.annotations_in([t["id"] for t in targets], from_ms, to_ms)
         return {
             "range": range, "bucket_ms": bucket_ms, "from_ms": from_ms, "to_ms": to_ms,
             "resolution": _resolution(store, from_ms, to_ms, bucket_ms),
             "targets": [{"id": t["id"], "host": t["host"], "label": t.get("label"),
-                         "points": series.get(t["id"], [])} for t in targets],
+                         "points": series.get(t["id"], []),
+                         "annotations": annos.get(t["id"], [])} for t in targets],
         }
 
     @app.get("/api/history/window")
@@ -344,10 +402,12 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
             return {"from_ms": from_ms, "to_ms": to_ms, "bucket_ms": 0, "targets": []}
         bucket_ms = _resolve_bucket(bucket, to_ms - from_ms, min(i["interval_s"] for i in targets))
         series = store.history([t["id"] for t in targets], from_ms, to_ms, bucket_ms)
+        annos = store.annotations_in([t["id"] for t in targets], from_ms, to_ms)
         return {"from_ms": from_ms, "to_ms": to_ms, "bucket_ms": bucket_ms,
                 "resolution": _resolution(store, from_ms, to_ms, bucket_ms),
                 "targets": [{"id": t["id"], "host": t["host"], "label": t.get("label"),
-                            "points": series.get(t["id"], [])} for t in targets]}
+                            "points": series.get(t["id"], []),
+                            "annotations": annos.get(t["id"], [])} for t in targets]}
 
     @app.get("/api/search")
     def search(q: str | None = None, target: str | None = None, hours: float = 24.0,
