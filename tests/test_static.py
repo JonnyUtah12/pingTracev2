@@ -74,7 +74,7 @@ def test_app_js_declares_no_top_level_name_twice():
 
 def test_app_js_endpoints_exist_in_api():
     """Every /api/... the dashboard calls must be a route api.py defines."""
-    called = set(re.findall(r"/api/[a-z._]+", APP_JS.read_text(encoding="utf-8")))
+    called = set(re.findall(r"/api/[a-z._-]+", APP_JS.read_text(encoding="utf-8")))
     routes = set(re.findall(
         r'@app\.(?:get|post|put|patch|delete)\("([^"]+)"',
         (ROOT / "api.py").read_text(encoding="utf-8")))

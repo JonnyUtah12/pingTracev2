@@ -835,7 +835,8 @@ class Engine:
                 for tid in wanted:
                     if tid not in self._tasks:
                         self._tasks[tid] = asyncio.create_task(self._worker(tid), name=f"probe-{tid}")
-                wanted_trace = {tid for tid, t in wanted.items() if t.get("trace_enabled")}
+                wanted_trace = {tid for tid, t in wanted.items()
+                                if t.get("trace_enabled") and not t.get("paused")}
                 for tid in list(self._trace_tasks):
                     if tid not in wanted_trace:
                         self._trace_tasks.pop(tid).cancel()
@@ -864,6 +865,12 @@ class Engine:
                 cfg = self.store.get_target(target_id)
                 if cfg is None or not cfg["enabled"]:
                     break
+                if cfg.get("paused"):
+                    # PingPlotter 5 parity: "Pause collection, keeping data".
+                    # The worker stays alive so live state and resume are
+                    # instant; it just idles until unpaused or removed.
+                    await asyncio.sleep(1.0)
+                    continue
                 state.host = cfg["host"]
                 interval = float(cfg["interval_s"])
                 proto = cfg["proto"] if cfg["proto"] in ("tcp", "udp", "icmp") else "tcp"
@@ -908,7 +915,8 @@ class Engine:
         try:
             while not self._stopping.is_set():
                 cfg = self.store.get_target(target_id)
-                if cfg is None or not cfg["enabled"] or not cfg.get("trace_enabled"):
+                if cfg is None or not cfg["enabled"] or not cfg.get("trace_enabled") \
+                        or cfg.get("paused"):
                     break
                 try:
                     await self.run_trace(target_id)
@@ -953,6 +961,7 @@ class Engine:
                 "proto": t["proto"],
                 "interval_s": float(t["interval_s"]),
                 "enabled": bool(t["enabled"]),
+                "paused": bool(t.get("paused")),
                 "trace_enabled": bool(t.get("trace_enabled")),
                 "trace_interval_s": float(t.get("trace_interval_s") or TRACE_LOOP_DEFAULT_S),
                 "status": status,

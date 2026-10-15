@@ -568,6 +568,14 @@ body.is-paused #clock { color: var(--warn); }
 .trace-bar-fill.trace-warn { background: color-mix(in srgb, var(--warn) 75%, transparent); }
 .trace-bar-fill.trace-bad { background: color-mix(in srgb, var(--bad) 75%, transparent); }
 .card.is-tracing { outline: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: -1px; }
+.card.is-paused { outline: 1px dashed color-mix(in srgb, var(--warn) 55%, transparent); outline-offset: -1px; }
+.card.is-paused .spark-wrap { opacity: .55; filter: saturate(.5); }
+.trace-hopname { color: var(--text); font-weight: 600; }
+.btn-hopname {
+  border: none; background: transparent; color: var(--text-dim);
+  font-size: 11px; padding: 0 2px; cursor: pointer; vertical-align: baseline;
+}
+.btn-hopname:hover { color: var(--accent); }
 .trace-bar-max {
   position: absolute; top: 1px; bottom: 1px; width: 2px;
   background: var(--text-dim); opacity: .6;

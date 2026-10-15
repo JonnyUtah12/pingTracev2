@@ -62,6 +62,27 @@ class TargetPatch(BaseModel):
     trace_enabled: bool | None = None
     trace_interval_s: float | None = None
     alert_route_changes: bool | None = None
+    paused: bool | None = None
+
+
+class HopNameBody(BaseModel):
+    address: str
+    name: str
+
+
+class TargetListEntry(BaseModel):
+    host: str
+    port: int | None = None
+    proto: str = "tcp"
+    label: str | None = None
+    interval_s: float | None = None
+    trace_enabled: bool = False
+    trace_interval_s: float | None = None
+    alert_route_changes: bool = False
+
+
+class TargetListImport(BaseModel):
+    targets: list[TargetListEntry]
 
 
 class AnnotationCreate(BaseModel):
@@ -279,6 +300,9 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
             # GAP-4 slice 2: GitHub route-change alerting is per-target
             # opt-in; default off, same posture as trace_enabled.
             fields["alert_route_changes"] = bool(body.alert_route_changes)
+        if body.paused is not None:
+            # PingPlotter 5 parity: pause collection, keeping all data.
+            fields["paused"] = bool(body.paused)
         row = store.update_target(target_id, **fields)
         eng.notify_config_changed()
         return {"target": row}
@@ -293,6 +317,85 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         eng._live.pop(target_id, None)
         eng.notify_config_changed()
         return {"ok": True}
+
+    # ------------------------------------------------- hop address book
+    # PingPlotter 5 parity ("Rename a target or hop" / AddressBook): label a
+    # router address once, see it everywhere. Keys are the responder address
+    # exactly as the trace recorded it; values are short display names.
+    @app.get("/api/hop-names")
+    def hop_names_list():
+        return {"names": store.list_hop_names()}
+
+    @app.put("/api/hop-names")
+    def hop_names_put(body: HopNameBody):
+        try:
+            row = store.set_hop_name(body.address, body.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"name": row}
+
+    @app.delete("/api/hop-names/{address}")
+    def hop_names_delete(address: str):
+        if not store.delete_hop_name(address):
+            raise HTTPException(status_code=404, detail="no such hop name")
+        return {"ok": True}
+
+    # ------------------------------------------------- target list files
+    # PingPlotter 5 parity ("Load/Save List File"): a portable JSON document
+    # describing a set of targets, so a monitoring setup can be shared or
+    # restored. Import is additive and idempotent (add_target upserts).
+    @app.get("/api/targets/export")
+    def targets_export():
+        rows = store.list_targets()
+        doc = {
+            "app": "pingTracev2",
+            "list_version": 1,
+            "exported_at": database.iso_utc(),
+            "targets": [{
+                "host": r["host"], "port": int(r["port"]), "proto": r["proto"],
+                "label": r.get("label"), "interval_s": float(r["interval_s"]),
+                "trace_enabled": bool(r.get("trace_enabled")),
+                "trace_interval_s": float(r.get("trace_interval_s") or 60),
+                "alert_route_changes": bool(r.get("alert_route_changes")),
+            } for r in rows],
+        }
+        return JSONResponse(doc, headers={
+            "Content-Disposition": 'attachment; filename="pingtrace-list.json"'})
+
+    @app.post("/api/targets/import")
+    def targets_import(body: TargetListImport):
+        if len(body.targets) > 200:
+            raise HTTPException(status_code=400, detail="too many targets (200 max)")
+        added, skipped = 0, 0
+        for e in body.targets:
+            try:
+                host = config.normalize_host(e.host)
+                proto = e.proto.lower()
+                if proto not in ("tcp", "udp", "icmp"):
+                    raise ValueError("bad proto")
+                port = 0 if proto == "icmp" else config.normalize_port(
+                    e.port if e.port is not None else settings.probe_port)
+                interval = (config.clamp_interval(e.interval_s)
+                            if e.interval_s is not None else settings.interval_s)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"invalid entry: {exc}")
+            if store.get_target_by(host, port, proto) is not None:
+                skipped += 1
+                continue
+            row = store.add_target(host, port, proto, interval, e.label)
+            extra = {}
+            if e.trace_enabled:
+                extra["trace_enabled"] = True
+                extra["trace_interval_s"] = max(
+                    engine_mod.TRACE_LOOP_MIN_S,
+                    min(engine_mod.TRACE_LOOP_MAX_S, e.trace_interval_s or 60.0))
+            if e.alert_route_changes:
+                extra["alert_route_changes"] = True
+            if extra:
+                store.update_target(int(row["id"]), **extra)
+            added += 1
+        eng.notify_config_changed()
+        return {"added": added, "skipped_existing": skipped}
 
     # ------------------------------------------------------------- profiles
     # GAP-7: named target sets (PingPlotter workspaces equivalent). Profiles

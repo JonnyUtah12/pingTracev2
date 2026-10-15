@@ -35,7 +35,8 @@
     'event-list', 'events-empty',
     'db-size', 'db-path', 'retention', 'engine-version',
     'modal', 'modal-title', 'modal-body', 'modal-cancel', 'modal-ok',
-    'btn-search', 'btn-export', 'export-status', 'resolution-readout', 'last-data',
+    'btn-search', 'btn-export', 'btn-list-export', 'btn-list-import', 'list-import-file',
+    'export-status', 'resolution-readout', 'last-data',
     'data-stale', 'targets-down', 'db-rows',
     'search-panel', 'search-form', 'btn-search-close', 'btn-search-go', 'btn-search-clear',
     'btn-search-export', 's-host', 's-error', 's-from', 's-to', 's-only-fail',
@@ -141,6 +142,7 @@
     series: new Map(),          // id -> {map:Map(ts->point), arr:[[ts,point]], sorted:bool, lastTs:number}
     hopGraphs: new Map(),       // id -> {hops:[...], bucketMs, at} from /hop-history
     hopGraphCollapsed: new Set(),
+    hopNames: {},               // address -> display name (address book)
     hiddenSeries: new Set(),
     dataVersion: 0,
     renderedPoints: 0,
@@ -804,6 +806,7 @@
         '<label class="switch switch-sm" title="keep re-running the route trace until turned off"><input type="checkbox" data-action="ctrace">trace loop</label>' +
         '<select class="mini-select" data-action="ctrace-interval" title="how often to re-run the route trace"></select>' +
         '<button type="button" class="btn btn-sm" data-action="trace" title="trace the hop-by-hop route to this target and back">trace route</button>' +
+        '<button type="button" class="btn btn-sm" data-action="pause" title="pause collection, keeping all data">pause</button>' +
         '<button type="button" class="btn btn-sm btn-danger" data-action="delete" title="delete this target">delete</button>' +
       '</div>' +
       '<div class="metrics">' +
@@ -860,6 +863,14 @@
     c.root.classList.toggle('is-disabled', t.enabled === false);
     c.root.classList.toggle('is-unknown', status === 'unknown');
     c.root.classList.toggle('is-tracing', t.trace_enabled === true);
+    c.root.classList.toggle('is-paused', t.paused === true);
+    const pauseBtn = c.root.querySelector('[data-action="pause"]');
+    if (pauseBtn) {
+      pauseBtn.textContent = t.paused ? 'resume' : 'pause';
+      pauseBtn.title = t.paused
+        ? 'resume collection — data is kept while paused'
+        : 'pause collection, keeping all data';
+    }
     setField(c, 'pill', status);
     if (c.fields.pill) c.fields.pill.className = 'pill status-' + status;
     setField(c, 'host', targetName(t));
@@ -975,6 +986,76 @@
   el['targets'].addEventListener('click', async (e) => {
     const traceBtn = e.target.closest('[data-action="trace"]');
     if (traceBtn) { runTraceFor(traceBtn); return; }
+    const pauseBtn = e.target.closest('[data-action="pause"]');
+    if (pauseBtn) {
+      const root = pauseBtn.closest('.card');
+      if (!root) return;
+      const id = Number(root.dataset.id);
+      const t = state.targets.get(id);
+      if (!t) return;
+      try {
+        const res = await api('/api/targets/' + id, { method: 'PATCH', body: { paused: !t.paused } });
+        setFormStatus(res.target.paused
+          ? 'collection paused for ' + targetName(res.target) + ' — data kept'
+          : 'collection resumed for ' + targetName(res.target), 'ok');
+        applyTarget(res.target);
+        kick('live');
+      } catch (err) {
+        setFormStatus('pause failed: ' + err.message, 'err');
+      }
+      return;
+    }
+    const hopNameBtn = e.target.closest('[data-action="hopname"]');
+    if (hopNameBtn) {
+      const addr = hopNameBtn.dataset.addr;
+      const current = state.hopNames[addr] || '';
+      const name = window.prompt('Name for ' + addr + ' (shown wherever this address appears; empty removes it):', current);
+      if (name === null) return;
+      try {
+        if (name.trim()) {
+          await api('/api/hop-names', { method: 'PUT', body: { address: addr, name: name.trim() } });
+          state.hopNames[addr] = name.trim();
+          setFormStatus('named hop ' + addr + ' as "' + name.trim() + '"', 'ok');
+        } else {
+          await api('/api/hop-names/' + encodeURIComponent(addr), { method: 'DELETE' });
+          delete state.hopNames[addr];
+          setFormStatus('removed name for ' + addr, 'ok');
+        }
+        // re-render any open trace panels so the new name shows immediately
+        cards.forEach((c) => {
+          const out = c.fields.traceout;
+          if (out && !out.hidden && out._trace) renderTrace(out, out._trace);
+        });
+      } catch (err) {
+        setFormStatus('hop name failed: ' + err.message, 'err');
+      }
+      return;
+    }
+    const copyBtn = e.target.closest('[data-action="copytext"]');
+    if (copyBtn) {
+      const out = copyBtn.closest('.trace-out');
+      const tr = out && out._trace;
+      if (!tr) return;
+      const lines = ['hop  address  avg_ms  max_ms  answered/sent'];
+      tr.hops.forEach((h) => {
+        const rs = (h.rtt_ms || []).filter((r) => typeof r === 'number');
+        const avg = rs.length ? (rs.reduce((a, b) => a + b, 0) / rs.length).toFixed(1) : '-';
+        const max = rs.length ? Math.max(...rs).toFixed(1) : '-';
+        lines.push(String(h.ttl).padEnd(5) + ' ' +
+          String(h.ip || '(silent)').padEnd(18) + ' ' +
+          String(avg).padEnd(7) + ' ' + String(max).padEnd(7) + ' ' +
+          (h.answered || 0) + '/' + (h.rtt_ms || []).length);
+      });
+      const foot = finalRoundTripLine(tr);
+      if (foot) lines.push('', foot);
+      try {
+        await navigator.clipboard.writeText(lines.join('\n'));
+        setFormStatus('hop table copied as text', 'ok');
+      } catch (err) {
+        setFormStatus('clipboard unavailable: ' + err.message, 'err');
+      }
+      return;
+    }
     const hopToggle = e.target.closest('[data-action="hopgraph-toggle"]');
     if (hopToggle) {
       const root = hopToggle.closest('.card');
@@ -1199,6 +1280,24 @@
     return 'ok';
   }
 
+  function finalRoundTripLine(tr) {
+    const hops = tr.hops || [];
+    const idx = hops.findIndex((h) => h.final);
+    const pick = idx >= 0 ? hops[idx] : [...hops].reverse().find((h) => (h.rtt_ms || []).some((r) => typeof r === 'number'));
+    if (!pick) return null;
+    const rs = (pick.rtt_ms || []).filter((r) => typeof r === 'number');
+    if (!rs.length) return null;
+    const avg = (rs.reduce((a, b) => a + b, 0) / rs.length).toFixed(1);
+    return (idx >= 0 ? 'round trip: ' : 'last answering hop: ') + avg + ' ms';
+  }
+
+  async function loadHopNames() {
+    try {
+      const data = await api('/api/hop-names');
+      state.hopNames = data.names || {};
+    } catch (err) { /* address book is optional polish; traces still render */ }
+  }
+
   function renderTrace(out, tr) {
     if (!tr || !Array.isArray(tr.hops)) {
       out.innerHTML = '<p class="trace-error">trace returned no hops</p>';
@@ -1209,8 +1308,11 @@
       ? 'route to ' + dest + ' — destination reached, ' + tr.hops.length + ' hop(s)'
       : 'route to ' + dest + ' — destination did not answer; showing the ' +
         tr.hops.length + ' hop(s) that did';
+    out._trace = tr;   // kept for "copy as text"
     let html = '<p class="trace-head">' + head +
-      ' <span class="trace-meta">' + fmtMs(tr.duration_ms) + ' · ' + esc(tr.method || '') + '</span></p>';
+      ' <span class="trace-meta">' + fmtMs(tr.duration_ms) + ' · ' + esc(tr.method || '') + '</span>' +
+      ' <button type="button" class="btn btn-sm btn-ghost" data-action="copytext"' +
+      ' title="copy this hop table as plain text">copy as text</button></p>';
 
     // Per-hop stats: average of the probes that answered, and the worst.
     const stats = tr.hops.map((h) => {
@@ -1244,10 +1346,16 @@
         (h.via || 'no reply');
       const badge = '<span class="trace-hop trace-' + band + '" title="' +
         esc(title) + '">' + esc(h.ttl) + '</span>';
+      const named = h.ip && state.hopNames[h.ip];
       const addr = h.ip
-        ? '<span class="trace-ip">' + esc(h.ip) + '</span>' +
+        ? (named ? '<span class="trace-hopname">' + esc(named) + '</span> ' : '') +
+          '<span class="trace-ip">' + esc(h.ip) + '</span>' +
           (h.hostname ? ' <span class="trace-name" title="' + esc(h.hostname) +
-            '">' + esc(h.hostname) + '</span>' : '')
+            '">' + esc(h.hostname) + '</span>' : '') +
+          ' <button type="button" class="btn btn-icon btn-hopname" data-action="hopname"' +
+          ' data-addr="' + esc(h.ip) + '" title="' +
+          (named ? 'rename this hop' : 'name this hop (shows everywhere this address appears)') +
+          '">✎</button>'
         : '<span class="trace-silent">·</span>';
       const avg = s.avg === null
         ? '<span class="trace-silent">·</span>'
@@ -2008,6 +2116,36 @@
   });
   if (el['btn-search-export']) el['btn-search-export'].addEventListener('click', () => downloadCsv('search-status'));
   if (el['btn-export']) el['btn-export'].addEventListener('click', () => downloadCsv('export-status'));
+
+  // PingPlotter 5 parity: save/load a target list as a portable file.
+  if (el['btn-list-export']) el['btn-list-export'].addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = '/api/targets/export';
+    a.download = 'pingtrace-list.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setFormStatus('target list exported as pingtrace-list.json', 'ok');
+  });
+  if (el['btn-list-import'] && el['list-import-file']) {
+    el['btn-list-import'].addEventListener('click', () => el['list-import-file'].click());
+    el['list-import-file'].addEventListener('change', async () => {
+      const f = el['list-import-file'].files && el['list-import-file'].files[0];
+      if (!f) return;
+      try {
+        const doc = JSON.parse(await f.text());
+        if (!doc || !Array.isArray(doc.targets)) throw new Error('not a pingtrace list file (missing targets array)');
+        const res = await api('/api/targets/import', { method: 'POST', body: { targets: doc.targets } });
+        setFormStatus('imported ' + res.added + ' target(s), ' + res.skipped_existing +
+          ' already present', 'ok');
+        kick('live');
+      } catch (err) {
+        setFormStatus('list import failed: ' + err.message, 'err');
+      } finally {
+        el['list-import-file'].value = '';
+      }
+    });
+  }
   if (el['btn-profile-switch']) el['btn-profile-switch'].addEventListener('click', switchProfile);
   if (el['btn-profile-save']) el['btn-profile-save'].addEventListener('click', saveProfile);
   if (el['btn-profile-delete']) el['btn-profile-delete'].addEventListener('click', deleteProfile);
@@ -2063,6 +2201,7 @@
     state.follow = el['toggle-follow'].checked;
     state.lossOverlay = el['toggle-loss'].checked;
     populateFormIntervals();
+    loadHopNames();
     createChart();
     setRange(state.range);
     tickClock();

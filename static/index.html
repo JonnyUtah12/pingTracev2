@@ -84,6 +84,11 @@
             title="search probe history by host and date range">Search</button>
     <button id="btn-export" class="btn" type="button"
             title="download the points plotted on the graph as CSV">Export CSV</button>
+    <button id="btn-list-export" class="btn" type="button"
+            title="download the current target set as a portable JSON list file">Export list</button>
+    <button id="btn-list-import" class="btn" type="button"
+            title="add targets from a JSON list file">Import list</button>
+    <input type="file" id="list-import-file" accept="application/json,.json" hidden>
 
     <div class="readouts">
       <span class="readout"><span class="hud-k">bucket</span><span id="bucket-readout" class="mono">—</span></span>

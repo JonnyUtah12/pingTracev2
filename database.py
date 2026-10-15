@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import config
 import route_diff
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS targets (
     trace_enabled INTEGER NOT NULL DEFAULT 0,
     trace_interval_s REAL NOT NULL DEFAULT 60,
     alert_route_changes INTEGER NOT NULL DEFAULT 0,
+    paused       INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE (host, port, proto)
 );
@@ -137,6 +138,12 @@ CREATE TABLE IF NOT EXISTS target_profile_entries (
     trace_interval_s REAL NOT NULL DEFAULT 60,
     UNIQUE (profile_id, host, port, proto)
 );
+
+CREATE TABLE IF NOT EXISTS hop_names (
+    address    TEXT PRIMARY KEY,
+    name       TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+    updated_at TEXT NOT NULL
+);
 """
 
 # GAP-7 note: target_profile_entries deliberately has no proto CHECK. Entries
@@ -215,6 +222,13 @@ class Store:
                 rcols = {r["name"] for r in c.execute("PRAGMA table_info(rollup)")}
                 if "jitter" not in rcols:
                     c.execute("ALTER TABLE rollup ADD COLUMN jitter REAL")
+            if prev is not None and int(prev["value"]) < 9:
+                # v9 (PingPlotter 5 parity): pause collection while keeping
+                # data, and a hop address book (rename routers/targets hops).
+                cols = {r["name"] for r in c.execute("PRAGMA table_info(targets)")}
+                if "paused" not in cols:
+                    c.execute("ALTER TABLE targets ADD COLUMN paused "
+                              "INTEGER NOT NULL DEFAULT 0")
             c.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
             c.execute("INSERT INTO meta(key, value) VALUES('app_version', ?) "
@@ -310,14 +324,20 @@ class Store:
     def get_target(self, target_id: int) -> dict | None:
         return self._row(self._conn().execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone())
 
+    def get_target_by(self, host: str, port: int, proto: str) -> dict | None:
+        return self._row(self._conn().execute(
+            "SELECT * FROM targets WHERE host=? AND port=? AND proto=?",
+            (host, port, proto)).fetchone())
+
     def update_target(self, target_id: int, **fields) -> dict | None:
         allowed = {"port", "proto", "label", "interval_s", "enabled", "host",
-                   "trace_enabled", "trace_interval_s", "alert_route_changes"}
+                   "trace_enabled", "trace_interval_s", "alert_route_changes",
+                   "paused"}
         sets, vals = [], []
         for k, v in fields.items():
             if k not in allowed or v is None:
                 continue
-            if k in ("enabled", "trace_enabled", "alert_route_changes"):
+            if k in ("enabled", "trace_enabled", "alert_route_changes", "paused"):
                 v = 1 if v else 0
             sets.append(f"{k}=?")
             vals.append(v)
@@ -340,6 +360,48 @@ class Store:
 
     def seed_targets(self, hosts, port: int, interval_s: float) -> list[dict]:
         return [self.add_target(h, port, "tcp", interval_s) for h in hosts]
+
+    # ---------------------------------------------------------- hop address book
+    # PingPlotter 5 parity ("Rename a target or hop", AddressBook): a stable
+    # label attached to a router address, shown wherever that address appears
+    # (route tables, hop graphs). Deliberately global, not per-target: the same
+    # router shows up on many paths. Names survive target deletion.
+    MAX_HOP_NAME = 80
+
+    @staticmethod
+    def _clean_hop_name(raw) -> str:
+        name = str(raw or "").strip()
+        if not name:
+            raise ValueError("hop name is empty")
+        if len(name) > Store.MAX_HOP_NAME:
+            raise ValueError(f"hop name is too long ({Store.MAX_HOP_NAME} characters max)")
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
+            raise ValueError("hop name must not contain control characters")
+        return name
+
+    def set_hop_name(self, address: str, name: str) -> dict:
+        address = str(address or "").strip()
+        if not address or len(address) > 100 or any(ord(ch) < 0x20 or ch in "\r\n\t" for ch in address):
+            raise ValueError("invalid hop address")
+        name = self._clean_hop_name(name)
+        with self._write_lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO hop_names(address, name, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(address) DO UPDATE SET name = excluded.name, "
+                "updated_at = excluded.updated_at",
+                (address, name, iso_utc()),
+            )
+            r = c.execute("SELECT * FROM hop_names WHERE address=?", (address,)).fetchone()
+        return dict(r)
+
+    def delete_hop_name(self, address: str) -> bool:
+        with self._write_lock, self._conn() as c:
+            cur = c.execute("DELETE FROM hop_names WHERE address=?", (str(address or "").strip(),))
+        return cur.rowcount > 0
+
+    def list_hop_names(self) -> dict[str, str]:
+        return {r["address"]: r["name"] for r in
+                self._conn().execute("SELECT address, name FROM hop_names ORDER BY address")}
 
     # ------------------------------------------------------------- profiles
     # GAP-7: named target sets (PingPlotter workspaces equivalent). Profiles

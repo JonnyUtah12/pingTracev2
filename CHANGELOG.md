@@ -7,6 +7,46 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-15
+
+PingPlotter 5 parity round, built from the reference material extracted out
+of the PingPlotter installer (closed-source; used for UI vocabulary and
+feature behaviour, not code). Three workflow gaps closed: pausing a target
+without losing data, naming routers once and seeing the name everywhere,
+and saving/restoring a whole target set as a file.
+
+### Added
+- **Pause / resume collection per target** (schema v9, `targets.paused`).
+  A card-level pause button stops probing and stops any running trace loop
+  while keeping every stored sample, live stats and the trace panel intact;
+  resume is instant. Paused targets are excluded from continuous trace
+  supervision.
+- **Hop address book** (`hop_names` table, `/api/hop-names` GET/PUT/DELETE):
+  name a router address once (e.g. "office gateway") and the name renders
+  in every route table where that address appears, on any target. Names are
+  global by address, survive target deletion, are validated (1-80 chars, no
+  control characters), and can be removed from the same ✎ control.
+- **Copy route as text**: each route panel has a "copy as text" button that
+  puts a plain-text hop table (hop, address, avg/max ms, answered/sent,
+  round-trip line) on the clipboard — the PingPlotter "copy trace" workflow.
+- **Target list files** (`GET /api/targets/export`, `POST /api/targets/import`):
+  download the current target set as a portable `pingtrace-list.json` and
+  import one back (additive and idempotent; existing targets are skipped).
+  Topbar "Export list" / "Import list" buttons drive it. This is the
+  equivalent of PingPlotter's Save/Load list file.
+
+### Changed
+- `tests/test_static.py` endpoint-consistency regex now understands
+  hyphenated route paths (`/api/hop-names`).
+
+### Verification
+- Full suite: 156 passed, 1 skipped (7 new parity tests in
+  `tests/test_pingplotter_parity.py`: schema v9 fresh + v8 upgrade, hop
+  name CRUD/validation, pause API + live snapshot, pause engine behaviour
+  for probing and trace loops, list export/import round-trip).
+- Live smoke: server starts on a fresh v9 db, hop naming and list export
+  exercised over HTTP.
+
 ## [2.0.1] - 2026-10-15
 
 Security audit (full dependency CVE scan + static analysis + manual code
