@@ -15,6 +15,12 @@
   const MAX_BACKOFF = 15000;
   const MIN_SPAN = 10000;
   const MAX_SPAN = 7 * 86400000;
+  /* GAP-1 slice 2: per-hop graph rows. The row cap mirrors TRACE_MAX_HOPS in
+     engine.py and Store.MAX_HOP_INDEX — the API never returns more. */
+  const HOPGRAPH_INTERVAL = 5000;
+  const MAX_HOP_ROWS = 30;
+  const HOP_PLOT_W = 1000;  // SVG viewBox width; stretched to the card width
+  const HOP_PLOT_H = 44;
   /* fixed, colour-blind-safe-ish palette; index by target order, never random */
   const PALETTE = ['#4EA6EA', '#E8A33D', '#3FB98A', '#E06C75', '#C678DD', '#56B6C2', '#D19A66', '#98C379'];
 
@@ -128,6 +134,8 @@
     targets: new Map(),         // id -> latest /api/live target object
     order: [],                  // stable id order -> stable palette index
     series: new Map(),          // id -> {map:Map(ts->point), arr:[[ts,point]], sorted:bool, lastTs:number}
+    hopGraphs: new Map(),       // id -> {hops:[...], bucketMs, at} from /hop-history
+    hopGraphCollapsed: new Set(),
     hiddenSeries: new Set(),
     dataVersion: 0,
     renderedPoints: 0,
@@ -208,6 +216,47 @@
     return '7d';
   }
 
+  /* ---------------------- per-hop graph rows (GAP-1 slice 2) ------------ */
+  /* PingPlotter's signature view: one compact time-series row per hop index,
+     top hop first, sharing the main chart's time window so the user can see
+     WHERE loss/latency starts. Rows come from /api/targets/{id}/hop-history
+     with the same range selector as the timeline; rendered rows are capped
+     at MAX_HOP_ROWS. Polled on its own slower cadence than /api/history —
+     hop data only changes when a trace runs. */
+  let hopGraphDue = 0, hopGraphFails = 0, hopGraphBusy = false;
+
+  function hopHistoryPath(id) {
+    return '/api/targets/' + id + '/hop-history?range=' +
+      encodeURIComponent(effectiveRange()) + '&bucket=auto';
+  }
+
+  async function refreshHopGraphs() {
+    if (hopGraphBusy) return;
+    hopGraphBusy = true;
+    let failed = false;
+    try {
+      for (const id of state.order) {
+        const data = await api(hopHistoryPath(id));
+        state.hopGraphs.set(id, {
+          hops: (data && data.hops) || [],
+          bucketMs: Number(data && data.bucket_ms) || 0,
+          at: Date.now()
+        });
+        renderHopGraph(id);
+      }
+    } catch (err) {
+      failed = true;
+      console.warn('[pingtrace] hop-history failed: ' + err.message);
+    } finally {
+      hopGraphBusy = false;
+      if (failed) hopGraphFails += 1; else hopGraphFails = 0;
+      const backoff = failed
+        ? Math.min(HOPGRAPH_INTERVAL * Math.pow(2, hopGraphFails), MAX_BACKOFF)
+        : HOPGRAPH_INTERVAL;
+      hopGraphDue = performance.now() + backoff;
+    }
+  }
+
   async function runJob(job) {
     if (job.busy) return;
     const path = job.path();
@@ -254,6 +303,9 @@
       if (job.gated && !state.autoRefresh) continue;
       if (document.hidden) continue;
       if (now >= job.due) runJob(job);
+    }
+    if (!state.paused && state.autoRefresh && !document.hidden && now >= hopGraphDue) {
+      refreshHopGraphs();
     }
     if (state.follow) {
       applyFollowWindow();
@@ -605,6 +657,7 @@
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
     kick('history');
+    hopGraphDue = 0;   // the hop rows follow the same range selector
     syncChart(true);
   }
 
@@ -687,7 +740,8 @@
       '</div>' +
       '<div class="loss-bar" title="packet loss"><div class="loss-fill" data-f="lossfill"></div>' +
       '<span class="loss-text mono" data-f="loss">0.0%</span></div>' +
-      '<div class="trace-out" data-f="traceout" hidden></div>';
+      '<div class="trace-out" data-f="traceout" hidden></div>' +
+      '<div class="hopgraph" data-f="hopgraph" hidden></div>';
   }
   function metric(k, f) {
     return '<div class="metric"><span class="metric-k">' + k + '</span>' +
@@ -791,6 +845,12 @@
     for (const id of state.series.keys()) {
       if (!state.targets.has(id)) state.series.delete(id);
     }
+    for (const id of state.hopGraphs.keys()) {
+      if (!state.targets.has(id)) state.hopGraphs.delete(id);
+    }
+    for (const id of Array.from(state.hopGraphCollapsed)) {
+      if (!state.targets.has(id)) state.hopGraphCollapsed.delete(id);
+    }
     for (const id of Array.from(state.hiddenSeries)) {
       if (!state.targets.has(id)) state.hiddenSeries.delete(id);
     }
@@ -841,6 +901,16 @@
   el['targets'].addEventListener('click', async (e) => {
     const traceBtn = e.target.closest('[data-action="trace"]');
     if (traceBtn) { runTraceFor(traceBtn); return; }
+    const hopToggle = e.target.closest('[data-action="hopgraph-toggle"]');
+    if (hopToggle) {
+      const root = hopToggle.closest('.card');
+      if (!root) return;
+      const id = Number(root.dataset.id);
+      if (state.hopGraphCollapsed.has(id)) state.hopGraphCollapsed.delete(id);
+      else state.hopGraphCollapsed.add(id);
+      renderHopGraph(id);
+      return;
+    }
     const btn = e.target.closest('[data-action="delete"]');
     if (!btn) return;
     const root = e.target.closest('.card');
@@ -1006,6 +1076,135 @@
       '<span class="mono">' + footValue + '</span></div>';
     html += '<p class="trace-note">' + esc(tr.note || '') + '</p>';
     out.innerHTML = html;
+  }
+
+  /* ---------------------- hop graph row rendering ----------------------- */
+  /* Each row is one hop index over the shared time window. The plot is an
+     SVG with a fixed viewBox stretched to the card (preserveAspectRatio
+     none + non-scaling strokes), so rows stay crisp at any card width and
+     need no resize handling. Nulls are never drawn as 0 ms: a bucket whose
+     hop answered nothing becomes a break in the line plus an explicit red
+     failure marker; loss paints as a red bar along the row's baseline. */
+  function hopNiceScale(v) {
+    if (v <= 10) return Math.max(1, Math.ceil(v));
+    if (v <= 100) return Math.ceil(v / 5) * 5;
+    if (v <= 1000) return Math.ceil(v / 50) * 50;
+    return Math.ceil(v / 500) * 500;
+  }
+  function svgN(v) { return Math.round(Number(v) * 100) / 100; }
+
+  function hopRowHtml(hop, w, color, bucketMs) {
+    const idx = Number(hop.hop_index);
+    const pts = Array.isArray(hop.points) ? hop.points : [];
+    const addrs = Array.isArray(hop.addresses) ? hop.addresses : [];
+    const W = HOP_PLOT_W, H = HOP_PLOT_H;
+
+    // Per-row y scale: each hop gets its own ms range, like the reference
+    // tool. The scale is stated in the row's tooltip, never guessed.
+    let peak = 0, lastAvg = null, lossSum = 0;
+    for (const p of pts) {
+      if (p[1] !== null && p[1] !== undefined) { peak = Math.max(peak, Number(p[1])); lastAvg = Number(p[1]); }
+      if (p[2] !== null && p[2] !== undefined) peak = Math.max(peak, Number(p[2]));
+      lossSum += Number(p[3]) || 0;
+    }
+    const scale = hopNiceScale(Math.max(peak * 1.15, 1));
+    const span = Math.max(1, w.to - w.from);
+    const xOf = (ts) => ((Number(ts) - w.from) / span) * W;
+    const yOf = (ms) => (H - 4) - (Math.min(Number(ms), scale) / scale) * (H - 10);
+
+    const gapLimit = Math.max(bucketMs || 0, 1000) * 1.75;
+    let d = '', pen = false, prevTs = null;
+    const marks = [];
+    for (const p of pts) {
+      const ts = Number(p[0]);
+      if (prevTs !== null && ts - prevTs > gapLimit) pen = false;
+      prevTs = ts;
+      const x = svgN(xOf(ts));
+      const avg = p[1];
+      if (avg === null || avg === undefined) {
+        pen = false;
+        marks.push('<line x1="' + x + '" y1="' + (H - 1) + '" x2="' + x + '" y2="' + (H - 14) +
+          '" stroke="var(--bad)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".85"/>');
+      } else {
+        d += (pen ? ' L' : ' M') + x + ' ' + svgN(yOf(avg));
+        pen = true;
+      }
+      const loss = Number(p[3]) || 0;
+      if (loss > 0) {
+        const bw = Math.max(1.5, ((bucketMs || 1000) / span) * W);
+        const lh = (Math.min(100, loss) / 100) * (H - 6);
+        marks.push('<rect x="' + svgN(x - bw / 2) + '" y="' + svgN(H - lh) + '" width="' + svgN(bw) +
+          '" height="' + svgN(lh) + '" fill="var(--bad)" opacity=".3"/>');
+      }
+    }
+
+    // Route-change awareness: the payload carries every responder seen at
+    // this hop index in the window. More than one = the path moved; mark
+    // where each superseded address was last seen.
+    let routeMarks = '';
+    if (addrs.length > 1) {
+      for (const a of addrs.slice(1)) {
+        const x = svgN(xOf(a.last_ms));
+        if (x >= 0 && x <= W) {
+          routeMarks += '<line x1="' + x + '" y1="2" x2="' + x + '" y2="' + (H - 2) +
+            '" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" vector-effect="non-scaling-stroke" opacity=".8"/>';
+        }
+      }
+    }
+
+    const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" class="hop-svg" aria-hidden="true">' +
+      '<line x1="0" y1="' + (H - 0.5) + '" x2="' + W + '" y2="' + (H - 0.5) +
+      '" stroke="var(--border-strong)" stroke-width="1" vector-effect="non-scaling-stroke" opacity=".5"/>' +
+      marks.join('') + routeMarks +
+      (d ? '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.5" vector-effect="non-scaling-stroke"/>' : '') +
+      '</svg>';
+
+    const band = hopBand(lastAvg);
+    const meanLoss = pts.length ? lossSum / pts.length : 0;
+    const flags = [];
+    if (pts.length && lastAvg === null) flags.push('<span class="hop-flag hop-flag-silent">silent</span>');
+    if (meanLoss > 0) flags.push('<span class="hop-flag hop-flag-loss" title="mean loss across buckets in the window">loss ' + Math.round(meanLoss) + '%</span>');
+    if (addrs.length > 1) {
+      const hist = addrs.map((a) => a.addr + ' (last seen ' + hhmm(a.last_ms) + ', ' + a.runs + ' runs)').join('\n');
+      flags.push('<span class="hop-flag hop-flag-route" title="address changed in this window:\n' + esc(hist) + '">route changed</span>');
+    }
+    const cur = addrs.length ? addrs[0] : null;
+    const addrHtml = cur
+      ? '<span class="hop-addr mono" title="last seen ' + hhmm(cur.last_ms) + (addrs.length > 1 ? '\n' + esc(addrs.map((a) => a.addr + ' (last ' + hhmm(a.last_ms) + ')').join('\n')) : '') + '">' + esc(cur.addr) + '</span>'
+      : '<span class="hop-addr hop-addr-silent mono" title="no responder at this hop in the window">·</span>';
+
+    return '<div class="hop-row" data-hop="' + idx + '" title="hop ' + idx +
+      ' · y-scale 0–' + scale + ' ms · ' + pts.length + ' bucket(s) in window">' +
+      '<div class="hop-label">' +
+        '<span class="trace-hop trace-' + band + '">' + idx + '</span>' +
+        addrHtml + flags.join('') +
+      '</div>' +
+      '<div class="hop-plot">' + svg + '</div>' +
+      '</div>';
+  }
+
+  function renderHopGraph(id) {
+    const c = cards.get(id);
+    const t = state.targets.get(id);
+    const box = c && c.fields.hopgraph;
+    if (!box) return;
+    const g = state.hopGraphs.get(id);
+    const hops = (g && g.hops) || [];
+    if (!hops.length || !t || state.hopGraphCollapsed.has(id)) { box.hidden = true; return; }
+    box.hidden = false;
+    const w = windowBounds();
+    const idx = state.order.indexOf(id);
+    const color = colorFor(idx < 0 ? 0 : idx);
+    const rows = hops.slice(0, MAX_HOP_ROWS).map((h) => hopRowHtml(h, w, color, g.bucketMs)).join('');
+    const more = hops.length > MAX_HOP_ROWS
+      ? '<p class="hop-more">+' + (hops.length - MAX_HOP_ROWS) + ' deeper hop(s) not graphed (cap ' + MAX_HOP_ROWS + ')</p>'
+      : '';
+    box.innerHTML = '<div class="hopgraph-head">' +
+      '<span class="hopgraph-title">hop graph</span>' +
+      '<span class="hopgraph-sub mono">' + hops.length + ' hop(s) · range ' + esc(state.range) +
+      ' · gaps = no data · red = loss</span>' +
+      '<button type="button" class="btn btn-sm btn-ghost" data-action="hopgraph-toggle">hide</button>' +
+      '</div><div class="hopgraph-rows">' + rows + more + '</div>';
   }
 
   function applyTarget(t) {

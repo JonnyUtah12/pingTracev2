@@ -82,3 +82,21 @@ def test_app_js_endpoints_exist_in_api():
     missing = {c for c in called
                if c not in declared and not any(c.startswith(d) for d in declared if d)}
     assert not missing, f"app.js calls routes api.py does not define: {missing}"
+
+
+def test_app_js_fetches_hop_history():
+    """GAP-1 slice 2: the per-hop graph rows must actually be fed by the
+    hop-history endpoint — a dashboard that only keeps the one-shot hop
+    table would silently ship the feature half-done."""
+    src = APP_JS.read_text(encoding="utf-8")
+    assert "/hop-history" in src, "app.js never fetches /api/targets/{id}/hop-history"
+    api_src = (ROOT / "api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/targets/{target_id}/hop-history")' in api_src, \
+        "api.py no longer serves the hop-history route app.js calls"
+    # the rendered rows are bounded, and the cap matches the engine's hop cap
+    m = re.search(r"MAX_HOP_ROWS\s*=\s*(\d+)", src)
+    assert m, "app.js does not cap rendered hop rows (MAX_HOP_ROWS)"
+    engine_src = (ROOT / "engine.py").read_text(encoding="utf-8")
+    cap = re.search(r"TRACE_MAX_HOPS\s*=\s*(\d+)", engine_src)
+    assert cap and int(m.group(1)) == int(cap.group(1)), \
+        "app.js hop-row cap drifted from engine.TRACE_MAX_HOPS"
