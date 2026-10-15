@@ -59,6 +59,7 @@ class TargetPatch(BaseModel):
     label: str | None = None
     trace_enabled: bool | None = None
     trace_interval_s: float | None = None
+    alert_route_changes: bool | None = None
 
 
 def _resolution(store: database.Store, from_ms: int, to_ms: int, bucket_ms: int) -> dict:
@@ -236,6 +237,10 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
             fields["trace_interval_s"] = max(engine_mod.TRACE_LOOP_MIN_S,
                                             min(engine_mod.TRACE_LOOP_MAX_S,
                                                 fields["trace_interval_s"]))
+        if body.alert_route_changes is not None:
+            # GAP-4 slice 2: GitHub route-change alerting is per-target
+            # opt-in; default off, same posture as trace_enabled.
+            fields["alert_route_changes"] = bool(body.alert_route_changes)
         row = store.update_target(target_id, **fields)
         eng.notify_config_changed()
         return {"target": row}

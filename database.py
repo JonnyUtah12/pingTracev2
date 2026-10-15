@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS targets (
     enabled    INTEGER NOT NULL DEFAULT 1,
     trace_enabled INTEGER NOT NULL DEFAULT 0,
     trace_interval_s REAL NOT NULL DEFAULT 60,
+    alert_route_changes INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE (host, port, proto)
 );
@@ -153,6 +154,16 @@ class Store:
                 tcols = {r["name"] for r in c.execute("PRAGMA table_info(traces)")}
                 if "method" not in tcols:
                     c.execute("ALTER TABLE traces ADD COLUMN method TEXT")
+            if prev is not None:
+                # GAP-4 slice 2: per-target opt-in for GitHub route-change
+                # alerting. Deliberately NOT version-gated: the v6 slot is
+                # shared with the concurrent GAP-2 jitter migration, so a DB
+                # already stamped v6 by that code can still lack this column.
+                # The column check makes the upgrade idempotent either way.
+                cols = {r["name"] for r in c.execute("PRAGMA table_info(targets)")}
+                if "alert_route_changes" not in cols:
+                    c.execute("ALTER TABLE targets ADD COLUMN alert_route_changes "
+                              "INTEGER NOT NULL DEFAULT 0")
             if prev is not None and int(prev["value"]) < 6:
                 # v6: GAP-2 per-bucket jitter. A nullable ADD COLUMN is all
                 # it takes - pre-v6 rollup rows keep NULL ("jitter unknown"),
@@ -214,6 +225,18 @@ class Store:
             conn.close()
             self._local.conn = None
 
+    # ------------------------------------------------------------------ meta
+    def meta_get(self, key: str) -> str | None:
+        """Read one meta value (alert bookkeeping lives here; see
+        github_sync's route-change alert dedupe)."""
+        row = self._conn().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row is not None else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        with self._write_lock, self._conn() as c:
+            c.execute("INSERT INTO meta(key, value) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
+
     @staticmethod
     def _row(r: sqlite3.Row | None) -> dict | None:
         return dict(r) if r is not None else None
@@ -245,12 +268,12 @@ class Store:
 
     def update_target(self, target_id: int, **fields) -> dict | None:
         allowed = {"port", "proto", "label", "interval_s", "enabled", "host",
-                   "trace_enabled", "trace_interval_s"}
+                   "trace_enabled", "trace_interval_s", "alert_route_changes"}
         sets, vals = [], []
         for k, v in fields.items():
             if k not in allowed or v is None:
                 continue
-            if k in ("enabled", "trace_enabled"):
+            if k in ("enabled", "trace_enabled", "alert_route_changes"):
                 v = 1 if v else 0
             sets.append(f"{k}=?")
             vals.append(v)
