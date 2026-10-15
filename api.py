@@ -284,6 +284,24 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         newest first). Empty list when the path has never changed."""
         return {"route_changes": store.list_route_changes(target_id, limit)}
 
+    @app.get("/api/targets/{target_id}/hop-history")
+    def hop_history(target_id: int, range: str = "1h", bucket: str = "auto"):
+        """GAP-1: per-hop latency/loss time series for one target (read-only,
+        bounded). Each hop index gets bucketed points with the same
+        null-vs-latency semantics as /api/history, plus the responder
+        addresses seen at that hop in the window. Unknown target -> empty."""
+        if range not in RANGES:
+            raise HTTPException(status_code=400, detail=f"range must be one of {', '.join(RANGES)}")
+        target = store.get_target(target_id)
+        to_ms = database.now_ms()
+        from_ms = to_ms - RANGES[range]
+        if target is None:
+            return {"range": range, "bucket_ms": 0, "from_ms": from_ms, "to_ms": to_ms, "hops": []}
+        bucket_ms = _resolve_bucket(bucket, to_ms - from_ms,
+                                   float(target.get("interval_s") or config.DEFAULT_INTERVAL_S))
+        return {"range": range, "bucket_ms": bucket_ms, "from_ms": from_ms, "to_ms": to_ms,
+                "hops": store.hop_history(target_id, from_ms, to_ms, bucket_ms)}
+
     # ----------------------------------------------------------- live/history
     @app.get("/api/live")
     def live():

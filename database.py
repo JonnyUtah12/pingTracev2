@@ -6,6 +6,8 @@ Layout:
   rollup    - 60s aggregates for data older than that window
   events    - up/down transitions and target add/remove audit trail
   traces    - on-demand route traces (hop lists as JSON), newest kept
+  hop_samples - one row per hop per trace run: the per-hop time series that
+                lets the dashboard graph hop N's latency/loss over time
 
 Raw rows are rolled up and deleted so a 1s probe interval over 7 days stays a
 few MB instead of hundreds of MB. Recent data (what the live graph shows) is
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 import config
 import route_diff
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -85,6 +87,19 @@ CREATE TABLE IF NOT EXISTS traces (
     hops_json   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS traces_ix ON traces (target_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS hop_samples (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    trace_id  INTEGER,
+    hop_index INTEGER NOT NULL,
+    ts_ms     INTEGER NOT NULL,
+    addr      TEXT,
+    rtt_ms    REAL,
+    probes    INTEGER NOT NULL DEFAULT 0,
+    answered  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS hop_samples_ix ON hop_samples (target_id, hop_index, ts_ms DESC);
 """
 
 MAX_EVENTS_KEPT = 5000
@@ -244,6 +259,7 @@ class Store:
             c.execute("DELETE FROM probes WHERE target_id=?", (target_id,))
             c.execute("DELETE FROM rollup WHERE target_id=?", (target_id,))
             c.execute("DELETE FROM traces WHERE target_id=?", (target_id,))
+            c.execute("DELETE FROM hop_samples WHERE target_id=?", (target_id,))
         return cur.rowcount > 0
 
     def seed_targets(self, hosts, port: int, interval_s: float) -> list[dict]:
@@ -304,6 +320,7 @@ class Store:
                  int(result.get("duration_ms") or 0), result.get("method"),
                  json.dumps(result.get("hops") or [])))
             new_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            self._insert_hop_samples(c, target_id, new_id, result.get("hops") or [])
             c.execute("DELETE FROM traces WHERE target_id=? AND id NOT IN "
                       "(SELECT id FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?)",
                       (target_id, target_id, MAX_TRACES_KEPT_PER_TARGET))
@@ -320,6 +337,27 @@ class Store:
         if row is None:  # the row we just inserted vanished; treat as a bug, not a silent None
             raise RuntimeError(f"trace {new_id} missing right after insert")
         return row
+
+    @staticmethod
+    def _insert_hop_samples(c: sqlite3.Connection, target_id: int, trace_id: int,
+                           hops: list) -> None:
+        """GAP-1: one hop_samples row per hop per trace run, in the same
+        transaction as the trace row, so on-demand and continuous tracing
+        both feed the per-hop time series.
+
+        ``rtt_ms`` is the mean of that hop's successful probe RTTs and stays
+        NULL when nothing answered - a timeout is never a 0 ms measurement.
+        ``probes``/``answered`` keep the per-run probe counts so loss can be
+        computed over probes, not just over whole-run success."""
+        ts = now_ms()
+        for hop in hops:
+            raw = hop.get("rtt_ms") or []
+            ok = [r for r in raw if isinstance(r, (int, float))]
+            c.execute(
+                "INSERT INTO hop_samples(target_id, trace_id, hop_index, ts_ms, "
+                "addr, rtt_ms, probes, answered) VALUES(?,?,?,?,?,?,?,?)",
+                (target_id, trace_id, int(hop.get("ttl") or 0), ts, hop.get("ip"),
+                 round(sum(ok) / len(ok), 3) if ok else None, len(raw), len(ok)))
 
     @staticmethod
     def _decode_trace(row: dict | None) -> dict | None:
@@ -453,6 +491,63 @@ class Store:
             out[tid] = pts
         return out
 
+    # ------------------------------------------------------------ hop history
+    MAX_HOP_INDEX = 30  # TRACE_MAX_HOPS in engine.py; bounds the query/rows
+
+    def hop_history(self, target_id: int, from_ms: int, to_ms: int,
+                    bucket_ms: int) -> list[dict]:
+        """GAP-1: per-hop time series for one target, oldest hop first.
+
+        Returns [{"hop_index": n, "points": [[ts, avg_rtt|null, max_rtt|null,
+        loss_pct], ...], "addresses": [{"addr", "last_ms", "runs"}, ...]}].
+
+        Same semantics as history(): buckets with zero samples are omitted so
+        the chart shows a real gap, and loss is failed probes over total
+        probes (a hop that answered nothing in a run contributes its whole
+        probe count to the numerator). ``rtt_ms`` is NULL for unanswered
+        runs, so aggregates never see a timeout as a latency. ``addresses``
+        lists the responders seen at that hop index in the window (newest
+        first) so the UI can label rows and flag route changes honestly.
+        """
+        bucket_ms = max(1000, int(bucket_ms))
+        hops: dict[int, dict] = {}
+        with self._conn() as c:
+            for r in c.execute(
+                "SELECT hop_index, (ts_ms / :b) * :b AS bucket, "
+                "  SUM(probes) AS n, SUM(probes - answered) AS n_fail, "
+                "  AVG(rtt_ms) AS avg_rtt, MAX(rtt_ms) AS max_rtt "
+                "FROM hop_samples "
+                "WHERE target_id = :t AND ts_ms >= :f AND ts_ms < :to "
+                "  AND hop_index BETWEEN 1 AND :h "
+                "GROUP BY hop_index, bucket ORDER BY hop_index, bucket",
+                    {"t": target_id, "f": from_ms, "to": to_ms, "b": bucket_ms,
+                     "h": self.MAX_HOP_INDEX}):
+                hop = hops.setdefault(int(r["hop_index"]), {"hop_index": int(r["hop_index"]),
+                                                            "points": [], "addresses": []})
+                n, n_fail = int(r["n"] or 0), int(r["n_fail"] or 0)
+                avg, max_rtt = r["avg_rtt"], r["max_rtt"]
+                hop["points"].append([
+                    int(r["bucket"]),
+                    None if avg is None else round(avg, 3),
+                    None if max_rtt is None else round(max_rtt, 3),
+                    round(100.0 * n_fail / n, 2) if n else 0.0])
+            for r in c.execute(
+                "SELECT hop_index, addr, MAX(ts_ms) AS last_ms, COUNT(*) AS runs "
+                "FROM hop_samples "
+                "WHERE target_id = :t AND ts_ms >= :f AND ts_ms < :to "
+                "  AND hop_index BETWEEN 1 AND :h AND addr IS NOT NULL "
+                "GROUP BY hop_index, addr",
+                    {"t": target_id, "f": from_ms, "to": to_ms, "h": self.MAX_HOP_INDEX}):
+                hops[int(r["hop_index"])]["addresses"].append(
+                    {"addr": r["addr"], "last_ms": int(r["last_ms"]), "runs": int(r["runs"])})
+        out = []
+        for idx in sorted(hops):
+            hop = hops[idx]
+            hop["addresses"].sort(key=lambda a: a["last_ms"], reverse=True)
+            hop["addresses"] = hop["addresses"][:5]  # a flapping hop must not flood the row label
+            out.append(hop)
+        return out
+
     # ------------------------------------------------------------- retention
     def prune(self, now: int | None = None) -> dict:
         """Roll up stale raw rows into 60s buckets, then drop them and old rollups."""
@@ -480,6 +575,7 @@ class Store:
             c.execute("DELETE FROM probes WHERE ts_ms < :c", {"c": cutoff})
             c.execute("DELETE FROM rollup WHERE ts_ms < :f", {"f": floor})
             c.execute("DELETE FROM probes WHERE ts_ms < :f", {"f": floor})
+            c.execute("DELETE FROM hop_samples WHERE ts_ms < :f", {"f": floor})
             c.execute("DELETE FROM events WHERE id NOT IN "
                       "(SELECT id FROM events ORDER BY id DESC LIMIT ?)", (MAX_EVENTS_KEPT,))
             c.execute("INSERT INTO meta(key, value) VALUES('last_prune', ?) "
@@ -492,6 +588,7 @@ class Store:
             "probes_raw": c.execute("SELECT COUNT(*) FROM probes").fetchone()[0],
             "rollup_rows": c.execute("SELECT COUNT(*) FROM rollup").fetchone()[0],
             "events": c.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            "hop_samples": c.execute("SELECT COUNT(*) FROM hop_samples").fetchone()[0],
             "db_size_bytes": self.db_size_bytes(),
         }
 

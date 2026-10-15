@@ -48,7 +48,8 @@ def test_v3_database_upgrades_to_v4(tmp_path):
         """)
     store = database.Store(path)
     assert store._conn().execute(
-        "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] == "4"
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] \
+        == str(database.SCHEMA_VERSION)
     rows = store.list_targets()
     assert len(rows) == 1 and rows[0]["host"] == "old.example"
     assert rows[0]["trace_enabled"] == 0 and rows[0]["trace_interval_s"] == 60.0
