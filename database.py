@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 
 import config
+import route_diff
 
 SCHEMA_VERSION = 4
 
@@ -265,10 +266,36 @@ class Store:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))]
 
+    def list_route_changes(self, target_id: int, limit: int = 20) -> list[dict]:
+        """Recent route-change events for one target (bounded, newest first).
+
+        ``detail`` is decoded from its JSON text into the diff dict so the
+        caller (the dashboard) does not need a second parse step."""
+        limit = max(1, min(int(limit), 100))
+        rows = [dict(r) for r in self._conn().execute(
+            "SELECT * FROM events WHERE target_id=? AND event='route-change' "
+            "ORDER BY id DESC LIMIT ?", (target_id, limit))]
+        for r in rows:
+            try:
+                r["detail"] = json.loads(r["detail"] or "{}")
+            except (TypeError, ValueError):
+                r["detail"] = {}
+        return rows
+
     # ---------------------------------------------------------------- traces
     def add_trace(self, target_id: int, host: str, result: dict) -> dict:
-        """Persist one trace result and keep only the newest per target."""
+        """Persist one trace result and keep only the newest per target.
+
+        §9 route-change detection: the new hop list is compared against the
+        previously stored trace for the same target (route_diff.compare_routes).
+        A real difference writes exactly one 'route-change' events row with the
+        JSON diff in ``detail``; identical routes write nothing, so the feed
+        never spams unchanged paths, and a target's first trace has nothing to
+        compare against and writes no event either.
+        """
         with self._write_lock, self._conn() as c:
+            prev = c.execute("SELECT hops_json FROM traces WHERE target_id=? "
+                             "ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
             c.execute(
                 "INSERT INTO traces(target_id, host, dest_ip, created_at, reached, "
                 "hop_count, duration_ms, method, hops_json) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -280,6 +307,14 @@ class Store:
             c.execute("DELETE FROM traces WHERE target_id=? AND id NOT IN "
                       "(SELECT id FROM traces WHERE target_id=? ORDER BY id DESC LIMIT ?)",
                       (target_id, target_id, MAX_TRACES_KEPT_PER_TARGET))
+            if prev is not None:
+                diff = route_diff.compare_routes(
+                    json.loads(prev["hops_json"] or "[]"), result.get("hops") or [])
+                if route_diff.route_changed(diff):
+                    c.execute(
+                        "INSERT INTO events(target_id, host, event, detail, created_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (target_id, host, "route-change", json.dumps(diff), iso_utc()))
             r = c.execute("SELECT * FROM traces WHERE id=?", (new_id,)).fetchone()
         row = self._decode_trace(self._row(r))
         if row is None:  # the row we just inserted vanished; treat as a bug, not a silent None

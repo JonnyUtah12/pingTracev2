@@ -278,6 +278,12 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
     def trace_list(target_id: int, limit: int = 10):
         return {"traces": store.list_traces(target_id, limit)}
 
+    @app.get("/api/targets/{target_id}/route-changes")
+    def route_changes(target_id: int, limit: int = 20):
+        """§9: recent route-change events for one target (read-only, bounded,
+        newest first). Empty list when the path has never changed."""
+        return {"route_changes": store.list_route_changes(target_id, limit)}
+
     # ----------------------------------------------------------- live/history
     @app.get("/api/live")
     def live():
