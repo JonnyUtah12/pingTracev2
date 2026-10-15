@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 import config
 import route_diff
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS rollup (
     avg_rtt   REAL,
     max_rtt   REAL,
     min_rtt   REAL,
+    jitter    REAL,
     PRIMARY KEY (target_id, ts_ms)
 );
 
@@ -152,6 +153,13 @@ class Store:
                 tcols = {r["name"] for r in c.execute("PRAGMA table_info(traces)")}
                 if "method" not in tcols:
                     c.execute("ALTER TABLE traces ADD COLUMN method TEXT")
+            if prev is not None and int(prev["value"]) < 6:
+                # v6: GAP-2 per-bucket jitter. A nullable ADD COLUMN is all
+                # it takes - pre-v6 rollup rows keep NULL ("jitter unknown"),
+                # never a fake 0.
+                rcols = {r["name"] for r in c.execute("PRAGMA table_info(rollup)")}
+                if "jitter" not in rcols:
+                    c.execute("ALTER TABLE rollup ADD COLUMN jitter REAL")
             c.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
             c.execute("INSERT INTO meta(key, value) VALUES('app_version', ?) "
@@ -448,26 +456,56 @@ class Store:
                 {"t": target_id, "f": from_ms, "to": to_ms, "b": bucket}):
             out[int(r["bucket"])] = [int(r["n"]), int(r["n_fail"]), float(r["sum_rtt"] or 0.0),
                                      int(r["n_ok"]), r["max_rtt"], r["min_rtt"]]
+        # GAP-2: per-bucket jitter from raw rows. The delta is taken between
+        # consecutive SUCCESSFUL probes - failures are skipped in the delta
+        # sequence (they still count in n_fail above), the bucket-level
+        # mirror of the live engine's jitter rule. A bucket with fewer than
+        # two successes gets no row here, and the caller emits NULL.
+        for r in c.execute(
+            "WITH ok AS ("
+            "  SELECT (ts_ms / :b) * :b AS bucket, rtt_ms, "
+            "    LAG(rtt_ms) OVER (PARTITION BY (ts_ms / :b) * :b "
+            "                           ORDER BY ts_ms, rowid) AS prev_rtt "
+            "  FROM probes "
+            "  WHERE target_id = :t AND ts_ms >= :f AND ts_ms < :to AND ok = 1"
+            ") SELECT bucket, AVG(ABS(rtt_ms - prev_rtt)) AS jitter "
+            "  FROM ok WHERE prev_rtt IS NOT NULL GROUP BY bucket",
+                {"t": target_id, "f": from_ms, "to": to_ms, "b": bucket}):
+            out[int(r["bucket"])].append(r["jitter"])
+        for v in out.values():
+            if len(v) == 6:
+                v.append(None)
         return out
 
     def _rollup_buckets(self, c, target_id, from_ms, to_ms, bucket) -> dict[int, list]:
         out = {}
+        # GAP-2: when one history bucket spans several rollup rows, the merged
+        # jitter is the mean over the union of each row's within-bucket
+        # deltas - weight each row by its delta count (n_ok - 1). No
+        # cross-minute delta is invented, and pre-v6 rows (jitter NULL)
+        # contribute nothing to either side of the fraction.
         for r in c.execute(
             "SELECT (ts_ms / :b) * :b AS bucket, SUM(n) AS n, SUM(n_fail) AS n_fail, "
             "  SUM((n - n_fail) * COALESCE(avg_rtt, 0)) AS sum_rtt, SUM(n - n_fail) AS n_ok, "
-            "  MAX(max_rtt) AS max_rtt, MIN(min_rtt) AS min_rtt "
+            "  MAX(max_rtt) AS max_rtt, MIN(min_rtt) AS min_rtt, "
+            "  SUM(CASE WHEN jitter IS NOT NULL THEN jitter * (n - n_fail - 1) ELSE 0.0 END) AS jnum, "
+            "  SUM(CASE WHEN jitter IS NOT NULL THEN n - n_fail - 1 ELSE 0 END) AS jden "
             "FROM rollup WHERE target_id = :t AND ts_ms >= :f AND ts_ms < :to "
             "GROUP BY bucket ORDER BY bucket",
                 {"t": target_id, "f": from_ms, "to": to_ms, "b": bucket}):
+            jden = int(r["jden"] or 0)
+            jitter = (float(r["jnum"]) / jden) if jden > 0 else None
             out[int(r["bucket"])] = [int(r["n"] or 0), int(r["n_fail"] or 0), float(r["sum_rtt"] or 0.0),
-                                     int(r["n_ok"] or 0), r["max_rtt"], r["min_rtt"]]
+                                     int(r["n_ok"] or 0), r["max_rtt"], r["min_rtt"], jitter]
         return out
 
     def history(self, target_ids, from_ms: int, to_ms: int, bucket_ms: int) -> dict[int, list]:
-        """Bounded series per target: [ts_ms, avg_rtt|null, max_rtt|null, loss_pct].
+        """Bounded series per target: [ts_ms, avg_rtt|null, max_rtt|null, loss_pct, jitter_ms|null].
 
         Buckets with zero probes are omitted entirely so the chart shows a real
-        gap rather than a fake flat line.
+        gap rather than a fake flat line. ``jitter_ms`` (GAP-2) is the mean
+        absolute RTT delta between consecutive successful probes inside the
+        bucket; NULL when the bucket holds fewer than two successes.
         """
         bucket_ms = max(1000, int(bucket_ms))
         merged: dict[int, dict[int, list]] = {}
@@ -483,11 +521,12 @@ class Store:
         for tid, acc in merged.items():
             pts = []
             for b in sorted(acc):
-                n, n_fail, sum_rtt, n_ok, max_rtt, _min_rtt = acc[b]
+                n, n_fail, sum_rtt, n_ok, max_rtt, _min_rtt, jitter = acc[b]
                 avg = (sum_rtt / n_ok) if n_ok else None
                 loss = (100.0 * n_fail / n) if n else 0.0
                 pts.append([b, None if avg is None else round(avg, 3),
-                            None if max_rtt is None else round(max_rtt, 3), round(loss, 2)])
+                            None if max_rtt is None else round(max_rtt, 3), round(loss, 2),
+                            None if jitter is None else round(jitter, 3)])
             out[tid] = pts
         return out
 
@@ -556,12 +595,34 @@ class Store:
         floor = now - self.retention_ms
         b = self.rollup_bucket_ms
         with self._write_lock, self._conn() as c:
+            # GAP-2: the jitter CTE computes each stale bucket's mean |Δrtt|
+            # over consecutive SUCCESSFUL probes (failures are skipped in the
+            # delta sequence but still count in n_fail) with a window
+            # function, so the rollup row carries it. On a re-rollup conflict
+            # the two jitters merge weighted by their delta counts
+            # (n_ok - 1): the merged value is the mean over the union of the
+            # within-batch deltas, never an invented cross-batch delta.
             c.execute(
-                "INSERT INTO rollup(target_id, ts_ms, n, n_fail, avg_rtt, max_rtt, min_rtt) "
-                "SELECT target_id, (ts_ms / :b) * :b, COUNT(*), "
-                "  SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), "
-                "  AVG(CASE WHEN ok = 1 THEN rtt_ms END), MAX(rtt_ms), MIN(rtt_ms) "
-                "FROM probes WHERE ts_ms < :c GROUP BY target_id, (ts_ms / :b) * :b "
+                "WITH ok_rows AS ("
+                "  SELECT target_id, (ts_ms / :b) * :b AS bucket, rtt_ms, "
+                "    LAG(rtt_ms) OVER (PARTITION BY target_id, (ts_ms / :b) * :b "
+                "                      ORDER BY ts_ms, rowid) AS prev_rtt "
+                "  FROM probes WHERE ts_ms < :c AND ok = 1"
+                "), jitter_per_bucket AS ("
+                "  SELECT target_id, bucket, AVG(ABS(rtt_ms - prev_rtt)) AS jitter "
+                "  FROM ok_rows WHERE prev_rtt IS NOT NULL GROUP BY target_id, bucket"
+                ") "
+                "INSERT INTO rollup(target_id, ts_ms, n, n_fail, avg_rtt, max_rtt, min_rtt, jitter) "
+                "SELECT g.target_id, g.bucket, g.n, g.n_fail, g.avg_rtt, g.max_rtt, g.min_rtt, "
+                "  j.jitter "
+                "FROM ( "
+                "  SELECT target_id, (ts_ms / :b) * :b AS bucket, COUNT(*) AS n, "
+                "    SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS n_fail, "
+                "    AVG(CASE WHEN ok = 1 THEN rtt_ms END) AS avg_rtt, "
+                "    MAX(rtt_ms) AS max_rtt, MIN(rtt_ms) AS min_rtt "
+                "  FROM probes WHERE ts_ms < :c GROUP BY target_id, (ts_ms / :b) * :b "
+                ") g LEFT JOIN jitter_per_bucket j "
+                "  ON j.target_id = g.target_id AND j.bucket = g.bucket "
                 "ON CONFLICT(target_id, ts_ms) DO UPDATE SET "
                 "  n = n + excluded.n, "
                 "  n_fail = n_fail + excluded.n_fail, "
@@ -569,7 +630,17 @@ class Store:
                 "    ((n - n_fail) * COALESCE(avg_rtt, 0) + (excluded.n - excluded.n_fail) * COALESCE(excluded.avg_rtt, 0)) "
                 "    / ((n - n_fail) + (excluded.n - excluded.n_fail)) ELSE NULL END, "
                 "  max_rtt = MAX(COALESCE(max_rtt, excluded.max_rtt), COALESCE(excluded.max_rtt, max_rtt)), "
-                "  min_rtt = MIN(COALESCE(min_rtt, excluded.min_rtt), COALESCE(excluded.min_rtt, min_rtt))",
+                "  min_rtt = MIN(COALESCE(min_rtt, excluded.min_rtt), COALESCE(excluded.min_rtt, min_rtt)), "
+                "  jitter = CASE WHEN "
+                "      (CASE WHEN rollup.jitter IS NOT NULL THEN rollup.n - rollup.n_fail - 1 ELSE 0 END) "
+                "    + (CASE WHEN excluded.jitter IS NOT NULL THEN excluded.n - excluded.n_fail - 1 ELSE 0 END) > 0 "
+                "    THEN ( "
+                "      COALESCE(rollup.jitter, 0.0) * (CASE WHEN rollup.jitter IS NOT NULL THEN rollup.n - rollup.n_fail - 1 ELSE 0 END) "
+                "    + COALESCE(excluded.jitter, 0.0) * (CASE WHEN excluded.jitter IS NOT NULL THEN excluded.n - excluded.n_fail - 1 ELSE 0 END) "
+                "    ) / ( "
+                "      (CASE WHEN rollup.jitter IS NOT NULL THEN rollup.n - rollup.n_fail - 1 ELSE 0 END) "
+                "    + (CASE WHEN excluded.jitter IS NOT NULL THEN excluded.n - excluded.n_fail - 1 ELSE 0 END) "
+                "    ) ELSE NULL END",
                 {"b": b, "c": cutoff})
             rolled = c.execute("SELECT COUNT(*) FROM probes WHERE ts_ms < :c", {"c": cutoff}).fetchone()[0]
             c.execute("DELETE FROM probes WHERE ts_ms < :c", {"c": cutoff})

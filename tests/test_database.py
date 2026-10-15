@@ -98,11 +98,12 @@ def test_history_bucket_loss_and_avg_math(store):
     pts = series[ids[0]]
 
     assert len(pts) == 1
-    ts, avg, mx, loss = pts[0]
+    ts, avg, mx, loss, jitter = pts[0]
     assert ts == base
     assert avg == pytest.approx(20.0)
     assert mx == 30.0
     assert loss == pytest.approx(25.0)
+    assert jitter == pytest.approx(10.0)   # GAP-2: deltas 10 and 10
 
 
 def test_history_omits_empty_buckets_and_all_failure_bucket_has_null_avg(store):
@@ -117,9 +118,10 @@ def test_history_omits_empty_buckets_and_all_failure_bucket_has_null_avg(store):
     pts = series[ids[1]]
 
     assert len(pts) == 1                             # the empty buckets are gaps, not zeros
-    _ts, avg, mx, loss = pts[0]
+    _ts, avg, mx, loss, jitter = pts[0]
     assert avg is None and mx is None
     assert loss == pytest.approx(100.0)
+    assert jitter is None                            # no successes -> no jitter, not 0
 
 
 def test_history_returns_a_key_for_every_requested_target(store):
@@ -128,6 +130,148 @@ def test_history_returns_a_key_for_every_requested_target(store):
     series = store.history(ids, now - 60_000, now, 1000)
     assert set(series) == set(ids)
     assert all(series[i] == [] for i in ids)
+
+
+# ------------------------------------------------------------------ jitter (GAP-2)
+# Bucket-level mirror of test_jitter_ignores_failures_between_samples: the
+# delta is taken between consecutive SUCCESSFUL RTTs; failures are skipped in
+# the delta sequence but still count in loss.
+
+def test_history_bucket_jitter_skips_failures_in_the_delta_sequence(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    bucket = 60_000
+    base = ((now // bucket) - 1) * bucket       # previous minute, inside the raw window
+    # 10 ok, fail, 30 ok, 20 ok in one bucket: consecutive SUCCESS deltas are
+    # |30-10| and |20-30| -> jitter 15.0; the failure still counts in loss.
+    plan = [(10.0, True), (None, False), (30.0, True), (20.0, True)]
+    for i, (rtt, ok) in enumerate(plan):
+        store.record_probe(ids[0], base + 1000 + i * 1000, ok, rtt,
+                           None if ok else "timeout")
+
+    series = store.history(ids, base - 60_000, base + bucket, bucket)
+    pts = series[ids[0]]
+
+    assert len(pts) == 1
+    ts, avg, mx, loss, jitter = pts[0]
+    assert jitter == pytest.approx(15.0)
+    assert loss == pytest.approx(25.0)
+
+
+def test_history_jitter_is_null_not_zero_for_thin_buckets(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    bucket = 60_000
+    base = ((now // bucket) - 2) * bucket
+    store.record_probe(ids[0], base + 1000, True, 12.0)                    # one success
+    for i in range(3):                                                    # all-failure bucket
+        store.record_probe(ids[0], base + bucket + 1000 + i * 1000, False, None, "timeout")
+
+    series = store.history(ids, base - 60_000, base + 2 * bucket, bucket)
+    pts = series[ids[0]]
+
+    assert [p[0] for p in pts] == [base, base + bucket]
+    assert [p[4] for p in pts] == [None, None]  # <2 successes -> NULL, never 0
+    assert pts[0][1] == pytest.approx(12.0)     # the single success still serves an avg
+    assert pts[1][1] is None
+
+
+def test_history_jitter_never_crosses_bucket_boundaries(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    bucket = 60_000
+    base = ((now // bucket) - 2) * bucket
+    for i, rtt in enumerate((10.0, 20.0)):
+        store.record_probe(ids[0], base + 1000 + i * 1000, True, rtt)
+    for i, rtt in enumerate((100.0, 110.0)):
+        store.record_probe(ids[0], base + bucket + 1000 + i * 1000, True, rtt)
+
+    series = store.history(ids, base - 60_000, base + 2 * bucket, bucket)
+    pts = series[ids[0]]
+
+    assert [p[0] for p in pts] == [base, base + bucket]
+    # each bucket's jitter is its own 10 ms; a cross-boundary delta would
+    # have invented |100-20| = 80 somewhere
+    assert [p[4] for p in pts] == [pytest.approx(10.0), pytest.approx(10.0)]
+
+
+def test_prune_stores_bucket_jitter_in_rollup_and_history_serves_it(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    grid = now - (now % store.rollup_bucket_ms)
+    old = grid - 900_000 + 30_000               # stale (>10min raw), inside retention
+    # ts order: 30 ok, fail, 10 ok -> one success-to-success delta of 20.0
+    plan = [(10.0, True), (None, False), (30.0, True)]
+    for i, (rtt, ok) in enumerate(plan):
+        store.record_probe(ids[0], old - i * 1000, ok, rtt, None if ok else "timeout")
+
+    store.prune(now)
+
+    row = store._conn().execute("SELECT n, n_fail, jitter FROM rollup WHERE target_id=?",
+                                (ids[0],)).fetchone()
+    assert row["n"] == 3 and row["n_fail"] == 1
+    assert row["jitter"] == pytest.approx(20.0)
+
+    series = store.history(ids, now - 3_600_000, now, 60_000)   # served from rollup
+    pts = series[ids[0]]
+    assert len(pts) == 1
+    assert pts[0][4] == pytest.approx(20.0)
+
+
+def test_prune_jitter_null_for_single_success_bucket(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    grid = now - (now % store.rollup_bucket_ms)
+    old = grid - 900_000 + 30_000
+    store.record_probe(ids[0], old, True, 15.0)
+
+    store.prune(now)
+
+    row = store._conn().execute("SELECT jitter FROM rollup WHERE target_id=?",
+                                (ids[0],)).fetchone()
+    assert row["jitter"] is None                # one success: NULL in the table too
+    series = store.history(ids, now - 3_600_000, now, 60_000)
+    assert series[ids[0]][0][4] is None
+
+
+def test_history_coarse_bucket_weights_rollup_jitters_by_delta_count(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    grid = now - (now % 120_000)                # 120 s aligned so both minutes merge
+    base = grid - 960_000                       # stale but inside retention
+    for i, rtt in enumerate((10.0, 20.0, 30.0)):    # jitter 10.0 over 2 deltas
+        store.record_probe(ids[0], base + 1000 + i * 1000, True, rtt)
+    for i, rtt in enumerate((100.0, 150.0)):        # jitter 50.0 over 1 delta
+        store.record_probe(ids[0], base + 61_000 + i * 1000, True, rtt)
+    store.prune(now)
+
+    fine = store.history(ids, now - 3_600_000, now, 60_000)[ids[0]]
+    assert [p[4] for p in fine] == [pytest.approx(10.0), pytest.approx(50.0)]
+    coarse = store.history(ids, now - 3_600_000, now, 120_000)[ids[0]]
+    assert len(coarse) == 1
+    # mean over the union of the within-minute deltas: (10*2 + 50*1) / 3
+    # (history() rounds served values to 3 decimals, hence abs=1e-3)
+    assert coarse[0][4] == pytest.approx((10.0 * 2 + 50.0 * 1) / 3, abs=1e-3)
+
+
+def test_prune_twice_merges_late_rows_into_existing_rollup_jitter(store):
+    ids = seed_three(store)
+    now = database.now_ms()
+    grid = now - (now % store.rollup_bucket_ms)
+    old = grid - 900_000 + 30_000
+    for i, rtt in enumerate((10.0, 20.0)):      # first batch: jitter 10.0, 1 delta
+        store.record_probe(ids[0], old - i * 1000, True, rtt)
+    store.prune(now)
+    for i, rtt in enumerate((100.0, 120.0)):    # late rows, same stale bucket: jitter 20.0
+        store.record_probe(ids[0], old - 10_000 - i * 1000, True, rtt)
+    store.prune(now)
+
+    row = store._conn().execute("SELECT n, jitter FROM rollup WHERE target_id=?",
+                                (ids[0],)).fetchone()
+    assert row["n"] == 4
+    # delta-count-weighted merge of the two batches (1 delta each): (10+20)/2.
+    # The merge never invents a cross-batch delta.
+    assert row["jitter"] == pytest.approx(15.0)
 
 
 def test_pick_bucket_stays_on_the_ladder_and_grows_with_the_span(store):
@@ -166,6 +310,40 @@ def test_prune_rolls_up_then_retention_drops(store):
     series = store.history(ids, now - 6 * 3_600_000, now, 60_000)
     assert len(series[ids[0]]) == 1                  # survived as rollup
     assert series[ids[1]] == []                      # past retention -> gone
+
+
+# ------------------------------------------------------------------- migration
+def test_v5_database_upgrades_to_v6(tmp_path):
+    """A v5-era file (rollup without a jitter column) opened by v6 code gains
+    the column, keeps its rows, and leaves old aggregates NULL - never 0.
+    Assert against SCHEMA_VERSION, never a literal."""
+    path = str(tmp_path / "v5.db")
+    store = database.Store(path, retention_ms=3_600_000, raw_window_ms=600_000,
+                          rollup_bucket_ms=60_000)
+    t = store.add_target("keep.example", 443, "tcp", 5.0)
+    now = database.now_ms()
+    grid = now - (now % store.rollup_bucket_ms)
+    old = grid - 900_000 + 30_000
+    for i, rtt in enumerate((10.0, 20.0)):
+        store.record_probe(t["id"], old - i * 1000, True, rtt)
+    store.prune(now)                                 # v6 code writes jitter
+    with store._conn() as c:                         # roll the file back to a v5-era layout
+        c.execute("ALTER TABLE rollup DROP COLUMN jitter")
+        c.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+    store.close()
+
+    store2 = database.Store(path, retention_ms=3_600_000, raw_window_ms=600_000,
+                           rollup_bucket_ms=60_000)
+    assert store2._conn().execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] \
+        == str(database.SCHEMA_VERSION)
+    cols = {r["name"] for r in store2._conn().execute("PRAGMA table_info(rollup)")}
+    assert "jitter" in cols, "rollup.jitter missing after v5->v6 upgrade"
+    row = store2._conn().execute("SELECT n, jitter FROM rollup WHERE target_id=?",
+                                 (t["id"],)).fetchone()
+    assert row["n"] == 2 and row["jitter"] is None   # pre-v6 aggregate: unknown, not 0
+    assert store2.list_targets()[0]["host"] == "keep.example"
+    store2.close()
 
 
 # --------------------------------------------------------------------- targets

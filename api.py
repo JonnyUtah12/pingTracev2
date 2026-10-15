@@ -410,11 +410,12 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["timestamp_iso", "target_id", "host", "bucket_ms", "avg_rtt_ms",
-                    "max_rtt_ms", "loss_pct"])
+                    "max_rtt_ms", "loss_pct", "jitter_ms"])
         for t in targets:
-            for ts, avg, mx, loss in series.get(t["id"], []):
+            for ts, avg, mx, loss, jitter in series.get(t["id"], []):
                 w.writerow([database.iso_utc(ts / 1000), t["id"], t["host"], bucket_ms,
-                           "" if avg is None else avg, "" if mx is None else mx, loss])
+                           "" if avg is None else avg, "" if mx is None else mx, loss,
+                           "" if jitter is None else jitter])
         name = f"pingtracev2-{stamp}.csv".replace(":", "").replace("-", "")
         return PlainTextResponse(buf.getvalue(), media_type="text/csv",
                                 headers={"Content-Disposition": f'attachment; filename="{name}"'})
