@@ -586,11 +586,24 @@ def create_app(store: database.Store, eng: engine_mod.Engine, settings: config.S
         series = store.history([t["id"] for t in targets], from_ms, to_ms, bucket_ms)
         buf = io.StringIO()
         w = csv.writer(buf)
+
+        def csv_safe(value):
+            """Spreadsheet-formula injection guard (CWE-1236).
+
+            Hostnames are user input; a cell starting with =, +, -, @, tab
+            or CR is evaluated as a formula/DDE command by Excel/Sheets
+            when the CSV is opened. Force such text cells to be literal.
+            Numeric columns hold numbers, never str, so '-' is safe here.
+            """
+            if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+                return "'" + value
+            return value
+
         w.writerow(["timestamp_iso", "target_id", "host", "bucket_ms", "avg_rtt_ms",
                     "max_rtt_ms", "loss_pct", "jitter_ms"])
         for t in targets:
             for ts, avg, mx, loss, jitter in series.get(t["id"], []):
-                w.writerow([database.iso_utc(ts / 1000), t["id"], t["host"], bucket_ms,
+                w.writerow([database.iso_utc(ts / 1000), t["id"], csv_safe(t["host"]), bucket_ms,
                            "" if avg is None else avg, "" if mx is None else mx, loss,
                            "" if jitter is None else jitter])
         name = f"pingtracev2-{stamp}.csv".replace(":", "").replace("-", "")

@@ -7,6 +7,28 @@ versions are tagged `vX.Y.Z` and the portable Windows zip is built by the
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-15
+
+Security audit (full dependency CVE scan + static analysis + manual code
+audit). No known CVEs were found in any pinned dependency; this release
+ships the audit's hardening fixes and a permanent CI security gate.
+
+### Added
+- CI security gate: every workflow run now executes
+  `pip-audit -r requirements.txt --strict` (zero dependency CVEs) and a
+  bandit HIGH-severity gate before the build step.
+- `tests/test_security.py`: regression tests pinning the audit findings.
+
+### Fixed
+- CSV export formula injection (CWE-1236): text cells beginning with
+  `=`, `+`, `-`, `@`, tab or CR are prefixed so Excel/Sheets treat them
+  as text instead of evaluating a formula/DDE command. Host input is
+  already strictly validated, so this is defense-in-depth.
+- GitHub token transport: `GitHubClient` now rejects any non-`https`
+  `api_base` or absolute URL, so the bearer token can never travel over
+  plaintext HTTP or a `file://` transport from a misconfigured
+  `github.json`.
+
 ## [2.0.0] - 2026-10-15
 
 First release of the pingTracev2 line (rebranded from pingTrace v1.3.2,

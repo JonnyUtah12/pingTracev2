@@ -33,6 +33,18 @@ jobs:
         shell: bash
         run: timeout 300 python -m pytest tests/ -v
 
+      # Security gate (2026-10-15 audit): dependency CVEs must be zero,
+      # and no HIGH-severity static findings. MEDIUM findings that are
+      # documented false positives (allowlist-built SQL fragments, shell-less
+      # subprocess with resolved-IP args) are listed in the audit report;
+      # raise the bar to -ll only after annotating them with # nosec.
+      - name: security gate
+        shell: bash
+        run: |
+          timeout 300 python -m pip install -q pip-audit bandit
+          timeout 300 python -m pip_audit -r requirements.txt --strict
+          timeout 300 python -m bandit -q -r . -x ./.venv,./tests,./__pycache__ -lll
+
       - name: build portable folder
         run: powershell -ExecutionPolicy Bypass -File packaging\build_portable.ps1
 

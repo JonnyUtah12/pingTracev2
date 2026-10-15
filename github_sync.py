@@ -76,6 +76,10 @@ class GitHubClient:
     """Minimal Classic REST client: JSON in, JSON out, clear errors out."""
 
     def __init__(self, token: str, repo: str = "", api_base: str = API, timeout: float = 20.0):
+        # The bearer token rides every request: never let a misconfigured
+        # base URL send it over plaintext http or a file:// transport.
+        if not api_base.startswith("https://"):
+            raise ValueError("github api_base must be an https:// URL")
         self.token = token
         self.repo = repo
         self.api_base = api_base
@@ -83,6 +87,8 @@ class GitHubClient:
 
     def _request(self, method: str, path: str, payload=None, allow_404: bool = False):
         url = path if path.startswith("http") else self.api_base + path
+        if not url.startswith("https://"):
+            raise ValueError("github API calls must use https")
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, method=method)
         req.add_header("Authorization", f"Bearer {self.token}")
